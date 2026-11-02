@@ -2,64 +2,63 @@
 
 **Quantile–Wasserstein Flow Matching for NMR Relaxation Spectrum Reconstruction**
 
-Conditional generation of NMR relaxation spectra from noisy decay measurements, using optimal transport in quantile space.
+Generate multiple nonnegative, unit-mass relaxation spectra conditioned on a noisy NMR decay signal. This repository provides synthetic data generation, model training, evaluation, and visualization for a manuscript currently under review.
 
-> Research implementation accompanying a manuscript currently under review.
-
-[Overview](#overview) · [Method](#method) · [Installation](#installation) · [Usage](#usage) · [Code structure](#code-structure) · [Paper](#paper)
-
-## Overview
-
-Recovering a relaxation spectrum from an NMR decay signal is an ill-conditioned inverse Laplace problem: different spectra can explain similar measurements. **QWFM learns to generate a distribution of candidate spectra conditioned on the observed decay, echo times, and noise level.** Each reconstruction is a complete, nonnegative spectrum with unit total mass.
-
-The central idea is to represent a spectrum by **quantile positions on the logarithmic relaxation-rate axis**. Linear interpolation of one-dimensional quantile functions describes a quadratic Wasserstein ($W_2$) geodesic: it transports spectral mass along the rate axis. QWFM uses a finite quantile representation of this path within conditional flow matching.
-
-### Key ideas
-
-- **Probabilistic reconstruction.** Generate multiple candidate spectra for the same measurement to study reconstruction ambiguity through approximate posterior sampling.
-- **Transport-aware spectral representation.** Learn in quantile coordinates, where interpolation moves mass along the ordered log-rate axis. Histogram-linear flow matching (HFM), also included here, interpolates masses at fixed rate bins.
-- **Direct training from simulated pairs.** Learn the quantile velocity with the standard flow-matching regression objective using spectrum–decay pairs. Posterior reference samples are used for evaluation, not as training targets.
-
-The repository includes a synthetic NMR simulator, training and sampling code, reference-posterior construction, evaluation, and visualization. Supporting baselines include HFM, deterministic regression, conditional VAEs, conditional normalizing flows, and classical regularized inversion methods.
+[Method](#method) · [Installation](#installation) · [Experiments](#experiments) · [Usage](#usage) · [Visualization](#visualization)
 
 ## Method
 
-The simulator draws target spectra from a Gamma-mixture prior and generates noisy measurements through an exponential decay kernel. Training pairs are generated on the fly. The flow's random starting spectra are drawn independently from a Dirichlet distribution; this source distribution is distinct from the prior over target spectra.
+QWFM represents a spectrum by **quantile positions on the log-rate axis**. Interpolating quantiles transports spectral mass along that axis; histogram-linear flow matching (HFM) instead interpolates masses at fixed bins. Training uses simulated spectrum–decay pairs, with a Gamma-mixture target prior and an independent Dirichlet source. SMC posterior references are used only for evaluation.
 
-1. **Encode spectra.** Convert source and target histograms into quantile vectors $\mathbf q_0$ and $\mathbf q_1$ on the normalized log-rate axis.
-2. **Learn the flow.** A conditional 1D U-Net predicts the velocity along the interpolating path, given the decay measurements, echo times, noise level, and flow time.
-3. **Generate candidates.** Integrate the learned velocity from a new source using explicit Euler steps. Clip positions to the supported interval and apply isotonic regression after each step to maintain nondecreasing quantiles.
-4. **Decode spectra.** Convert the final quantiles into nonnegative, unit-mass histograms. Repeat with new sources to obtain multiple reconstructions for one observation.
+### 1. Encode histograms as quantiles
 
-The training path and objective are
+For bin masses $h_n$ on normalized log-rate bins $[b_{n-1},b_n)$, $b_n=n/N$, assume uniform density within each bin. At midpoint mass levels $u_\ell$, invert the piecewise-linear CDF:
 
 $$
-\mathbf q_t=(1-t)\mathbf q_0+t\mathbf q_1,
-\qquad t\sim\mathcal U(0,1),
+\begin{aligned}
+C_n&=\sum_{j=1}^{n}h_j,\quad C_0=0,\qquad u_\ell=\frac{\ell+1/2}{L},\\
+q_\ell&=b_{n-1}+\frac{u_\ell-C_{n-1}}{h_n}(b_n-b_{n-1}),
+\qquad C_{n-1}\le u_\ell<C_n.
+\end{aligned}
 $$
 
+Here $\ell=0,\ldots,L-1$; each $q_\ell$ is a spectral position at a fixed cumulative mass level.
+
+### 2. Learn a conditional quantile flow
+
+On this normalized axis, one-dimensional Wasserstein geometry gives
+$W_2^2=\int_0^1|Q_1(u)-Q_0(u)|^2\,du\approx L^{-1}\|\mathbf q_1-\mathbf q_0\|_2^2$.
+Linear interpolation of the full quantile functions is a $W_2$ geodesic. A conditional 1D U-Net learns its finite-coordinate velocity:
+
 $$
-\mathcal L_{\mathrm{QWFM}}=
+\begin{aligned}
+\mathbf q_t&=(1-t)\mathbf q_0+t\mathbf q_1,\qquad t\sim\mathcal U(0,1),\\
+\mathcal L_{\mathrm{QWFM}}&=
 \mathbb E\!\left[\frac{1}{L}
-\left\|v_\theta(\mathbf q_t,t,\mathbf c)-(\mathbf q_1-\mathbf q_0)\right\|_2^2\right],
+\left\|v_\theta(\mathbf q_t,t,\mathbf c)-(\mathbf q_1-\mathbf q_0)\right\|_2^2\right].
+\end{aligned}
 $$
 
-where $\mathbf c$ contains the measurement, acquisition, and noise information, and $L$ is the number of quantiles. Flow time $t$ is distinct from the physical echo times. The quantile count can be selected independently of the number of spectrum bins.
+The condition $\mathbf c$ contains the observed decay, echo times, and noise level. Sampling uses Euler steps with clipping and isotonic projection to keep quantiles bounded and ordered.
 
-```mermaid
-flowchart LR
-    S["Random source spectrum"] --> Q["Quantile encoding"]
-    Q --> F["Learned quantile flow"]
-    Y["Decay, echo times, noise level"] --> F
-    F --> H["Histogram decoding"]
-    H --> R["Candidate spectrum"]
-```
+### 3. Decode quantiles into bin masses
 
-**Scope.** The supplied workflows use one-dimensional synthetic relaxation spectra with fixed acquisition schedules and Gaussian noise. They provide a research workflow for training and evaluation; importing experimental instrument files requires additional data preparation.
+The **linear-CDF decoder** interpolates generated quantiles and recovers cumulative mass at bin boundaries:
+
+$$
+\begin{aligned}
+\widehat Q(u)&=(1-\alpha)\widehat q_\ell+\alpha\widehat q_{\ell+1},
+\qquad \alpha=\frac{u-u_\ell}{u_{\ell+1}-u_\ell},\quad u_\ell\le u\le u_{\ell+1},\\
+\widehat F_n&=\int_0^1\mathbf 1\{\widehat Q(u)<b_n\}\,du,\qquad 1\le n<N,\\
+\widehat h_n&=\widehat F_n-\widehat F_{n-1},\qquad n=1,\ldots,N.
+\end{aligned}
+$$
+
+Endpoint quantiles use half-step extrapolation clipped to $[0,1]$, with $\widehat F_0=0$ and $\widehat F_N=1$. Repeating the flow from new sources yields multiple candidate spectra. See the [representation utilities](codes/utils/nmr_utils.py), [training objective](codes/trainers/quantile_wasserstein_trainer.py), and [sampler](codes/samplers/quantile_wasserstein_sampler.py).
 
 ## Installation
 
-Use **Linux/Bash** and a Python environment with a **CUDA-compatible PyTorch** installation. Install the [PyTorch build appropriate for your machine](https://pytorch.org/get-started/locally/) first, then install the repository dependencies:
+Use **Linux/Bash, Python 3.11+, and CUDA-compatible PyTorch**. Install the appropriate PyTorch build first, then:
 
 ```bash
 git clone https://github.com/rechido/qwfm_nmr_reconstruction.git
@@ -67,110 +66,91 @@ cd qwfm_nmr_reconstruction
 python -m pip install -r requirements.txt
 ```
 
-Dependencies include PyTorch, Hugging Face Accelerate and Diffusers, NumPy, SciPy, and Matplotlib. Version constraints are listed in [requirements.txt](requirements.txt).
+Dependencies are pinned or bounded in [requirements.txt](requirements.txt). The workflows generate synthetic 1D NMR data locally; no dataset download is required. Pretrained checkpoints are not included.
 
-Training data are generated locally, so no dataset download is needed. Pretrained checkpoints are not included; train a model before running its sampling and evaluation scripts.
+## Experiments
+
+| Setting | Measurements M | Spectrum bins N | QWFM quantiles L | Complete command list |
+| --- | ---: | ---: | ---: | --- |
+| `m32n128` | 32 | 128 | 128 | [Commands](run_examples_m32n128.txt) |
+| `m64n128` | 64 | 128 | 128 | [Commands](run_examples_m64n128.txt) |
+| `m128n256` | 128 | 256 | 256 | [Commands](run_examples_m128n256.txt) |
+
+Each setting includes **HFM, QWFM, MSE+W1 regression, and CVAE (z=16)**. HFM/QWFM sweep NFE (network evaluations) over **1, 4, 16, 64, 256**; regression and CVAE are NFE-independent. QWFM uses **L=N and linear-CDF decoding**.
+
+| Evaluation | Included experiments |
+| --- | --- |
+| Precision/recall and F1 summary | Comparison against SMC references under histogram L2 and log-rate W1/W2 |
+| Energy score / kernel score (ES/KS) | Independent-test evaluation under L2 and exact log-rate W2 |
+| Forward consistency | Decay errors for individual spectra and the mean spectrum |
+| Qualitative reconstruction | Five truth-selected cases: a broad single peak and two to five separated peaks; spectra and decays at flow NFE=256 |
+
+PR uses 32 conditions, 256 predictions per condition, and three audited 4,096-particle SMC banks; its W2 distance uses 2,048 midpoint quantiles. ES/KS and forward consistency use 16,384 independent test pairs, with eight draws per stochastic model and one prediction for regression.
 
 ## Usage
 
-The example below uses **64 measurements, 128 spectrum bins, and 128 quantiles** (`m64n128`, `L=128`). Run commands from the repository root.
+**Copy commands from the lists above; no shell arguments are required.** All settings are inside [the scripts](scripts/paper/). Run from the repository root in your activated environment. Follow the list order, not the numerical order of filenames.
 
-**Before running:** the training and proper-score sample-generation scripts default to four GPUs (`GPU_IDS="0,1,2,3"`, `NUM_PROCESSES="4"`). Review these settings and the batch sizes in the scripts. The defaults are full research runs, including 200,000 training iterations.
+Run shared preparation once per setting, then complete any model's **training → generation → evaluation → visualization** block. The defaults use **four GPUs for training/independent sampling and one for SMC/PR**. Set `GPU_IDS` and `NUM_PROCESSES` inside the scripts for your machine; when changing GPU count, adjust batch size and gradient accumulation to retain the effective batch of **2,048**. Full runs train for **200,000 updates**, and evaluation requires the final EMA checkpoint.
 
-<details>
-<summary>Using a single GPU</summary>
-
-- In the training script, set `GPU_IDS="0"` and `NUM_PROCESSES="1"`; its launcher already supports a single process. Reduce `--train_batch_size` if needed.
-- In the proper-score sample-generation script, replace `accelerate launch` and its launcher options (through `--main_process_port 0`) with `CUDA_VISIBLE_DEVICES=0 python`. Keep the Python entry point and its arguments. This script uses `--multi_gpu` unconditionally, so changing the GPU variables alone is insufficient.
-
-</details>
-
-### 1. Train QWFM
+Example: complete QWFM at M64/N128 without running any other model:
 
 ```bash
-bash scripts/m64n128/02_train_quantile_wasserstein_l128.sh
+# Shared preparation; the SMC audit must complete without rejection.
+bash scripts/paper/m64n128/00_prepare_test_conditions.sh
+bash scripts/paper/m64n128/10_build_reference_run0.sh
+bash scripts/paper/m64n128/11_build_reference_run1.sh
+bash scripts/paper/m64n128/12_build_reference_run2.sh
+bash scripts/paper/m64n128/13_audit_references.sh
+
+# QWFM: train, save predictions, evaluate, then visualize.
+bash scripts/paper/m64n128/02_train_quantile_wasserstein.sh
+bash scripts/paper/m64n128/31_generate_quantile_wasserstein_samples.sh
+bash scripts/paper/m64n128/41_evaluate_quantile_wasserstein_scores.sh
+bash scripts/paper/m64n128/51_evaluate_quantile_wasserstein_forward.sh
+bash scripts/paper/m64n128/21_evaluate_pr_quantile_wasserstein.sh
+bash scripts/paper/m64n128/61_visualize_quantile_wasserstein.sh
 ```
 
-This generates training pairs and saves model checkpoints, configuration, and logs under `outputs/m64n128/`. The script resumes from the latest compatible checkpoint when one exists. Evaluation uses the saved exponential-moving-average model weights.
+PR generates its own predictions for the SMC conditions. ES/KS, forward consistency, and visualization reuse saved artifacts on CPU. Training resumes from compatible checkpoints; generation reuses compatible caches. Keep the completed checkpoint fixed throughout evaluation.
 
-### 2. Generate samples and evaluate with simulated ground truth
+## Visualization
 
-Prepare a shared set of observation–spectrum pairs, generate conditional reconstruction samples, and compute the **energy score (ES)** and **Gaussian kernel score (KS)**:
+| Level | Required completed work | Example command |
+| --- | --- | --- |
+| One model | That model in one setting | `bash scripts/paper/m64n128/61_visualize_quantile_wasserstein.sh` |
+| Within-setting comparison | Four models in that setting | `bash scripts/paper/m64n128/70_compare_models.sh` |
+| Across-setting comparison | Four models in all three settings | `bash scripts/paper/90_export_results.sh` |
 
-```bash
-bash scripts/m64n128/proper_scores/00_prepare_test_conditions.sh
-bash scripts/m64n128/proper_scores/quantile_wasserstein_l128/01_generate_samples.sh
-bash scripts/m64n128/proper_scores/quantile_wasserstein_l128/02_evaluate_scores.sh
-```
+The first two levels are included in every setting's command list. The last is separate in [run_examples_comparisons.txt](run_examples_comparisons.txt).
 
-The first command prepares evaluation data, the second loads the trained model, and the third computes scores on CPU and produces comparison tables and figures. This workflow does not require SMC reference samples.
+All levels export **PNG/PDF metric plots** and **CSV summaries** for PR, ES/KS, forward consistency, and the flow-model NFE sweep. Numerical outputs include `all_metrics.csv`, `metrics_at_max_nfe.csv` (including F1), and `forward_consistency.csv`.
 
-<details>
-<summary>Alternative evaluation: compare samples with SMC posterior references</summary>
-
-Build three independent sequential Monte Carlo (SMC) reference runs, then audit their consistency. Run model evaluation only after the audit passes:
-
-```bash
-bash scripts/m64n128/00a_build_posterior_reference_run0.sh
-bash scripts/m64n128/00b_build_posterior_reference_run1.sh
-bash scripts/m64n128/00c_build_posterior_reference_run2.sh
-bash scripts/m64n128/00d_audit_posterior_references.sh
-bash scripts/m64n128/02_evaluate_quantile_wasserstein_l128.sh
-```
-
-This workflow compares generated and reference samples using spectral distances and precision, recall, density, and coverage (PRDC), together with forward-decay consistency diagnostics. The reference-building scripts use CUDA; the QWFM evaluation script defaults to one GPU.
-
-To plot the saved SMC-based evaluation metrics and reconstructed spectra:
-
-```bash
-bash scripts/m64n128/90_plot_metrics_all_methods.sh
-bash scripts/m64n128/94_visualize_all_methods.sh
-```
-
-These plotting scripts skip methods whose evaluation files are absent, so they can be used after evaluating QWFM alone.
-
-</details>
-
-### 3. Inspect outputs and select other configurations
-
-All generated artifacts for this setting are stored under `outputs/m64n128/`:
-
-| Location | Contents |
+| Output location | Contents |
 | --- | --- |
-| `quantile_wasserstein_m64_n128_l128_unet64x4_t1024/` | Model checkpoints, configuration, training logs, and SMC-based model evaluations |
-| `proper_scores/` | Shared synthetic test pairs and generated reconstruction samples |
-| `metric_comparisons/` | Evaluation summaries, comparison tables, and metric plots |
-| `qualitative/` | Reconstruction figures from the SMC-based visualization workflow |
-| `reference_smc4096_v2/` | SMC reference samples and audit artifacts, when that workflow is run |
+| `outputs/<setting>/visualizations/models/<variant>/` | One model's metric plots and reconstruction previews |
+| `outputs/<setting>/visualizations/comparison/` | Within-setting model comparisons |
+| `outputs/visualizations/all_settings/` | Combined metric plots and CSV summaries |
 
-The launch scripts also provide QWFM variants with **256 or 512 quantiles** and a **32-measurement** setting. Complete command lists for the available models and workflows are in [32-measurement examples](run_examples_m32n128.txt) and [64-measurement examples](run_examples_m64n128.txt). Keep the simulator settings and output paths consistent across training and evaluation.
+Model and within-setting folders contain `metrics/` and `reconstructions/`. Reconstruction plots show all saved draws and their mean, with ground-truth references and the original observation noise; case IDs are saved in `selected_cases.csv`. Input provenance is recorded alongside the outputs. Checkpoints, samples, and evaluation reports remain under `outputs/<setting>/`.
 
-## Code structure
+Optional method illustration: `bash scripts/paper/92_plot_transport_paths.sh` draws histogram/quantile interpolation paths without any trained model.
 
-| Path | Purpose |
-| --- | --- |
-| [`codes/data/`](codes/data/) | Spectrum and decay simulation, grids, and SMC references |
-| [`codes/train/`](codes/train/) | Training entry points |
-| [`codes/trainers/`](codes/trainers/) | Model-specific training objectives |
-| [`codes/samplers/`](codes/samplers/) | Reconstruction and sampling implementations |
-| [`codes/evaluate/`](codes/evaluate/) | Sample generation, reference audits, evaluation, and plotting |
-| [`codes/metrics/`](codes/metrics/) | Spectral distances, distributional scores, and physics diagnostics |
-| [`codes/utils/`](codes/utils/) | Representations, conditioning, model configuration, and checkpoints |
-| [`scripts/`](scripts/) | Configured launch scripts for the supported workflows |
+## Tests
 
-For the core QWFM implementation, start with the [training objective](codes/trainers/quantile_wasserstein_trainer.py), [sampler](codes/samplers/quantile_wasserstein_sampler.py), and [histogram–quantile utilities](codes/utils/nmr_utils.py).
+```bash
+CUDA_VISIBLE_DEVICES="" python -m unittest discover -s tests -v
+```
 
-## Paper
+These checks use small fixtures; they do not run full training or benchmarks.
 
-**Quantile–Wasserstein Flow Matching for NMR Relaxation Spectrum Reconstruction**
+## Paper and contact
 
-Da Eun Lee and Byung-Woo Hong · Department of AI, Chung-Ang University
+*Quantile–Wasserstein Flow Matching for NMR Relaxation Spectrum Reconstruction*
 
-*Manuscript under review.*
+Da Eun Lee and Byung-Woo Hong, Chung-Ang University. **Manuscript under review.**
 
-## Questions and contributions
-
-Please use [GitHub Issues](https://github.com/rechido/qwfm_nmr_reconstruction/issues) for questions and bug reports. Include the command you ran, your environment, and the relevant error output. Proposed improvements can be submitted as pull requests.
+For questions and bug reports, use [GitHub Issues](https://github.com/rechido/qwfm_nmr_reconstruction/issues).
 
 ## License
 

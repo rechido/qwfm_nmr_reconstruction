@@ -14,8 +14,95 @@ from typing import Any
 
 import torch
 
+from ..data.grid import build_nmr_grid
+from ..data.spec import ContinuousNMRSpec
+from .distances import (
+    DISTANCE_PROTOCOL_VERSION,
+    W2_EXACT_PROTOCOL_VERSION,
+    canonical_metric_name,
+    pairwise_distances,
+    pairwise_w2_exact,
+    validate_log_rate_edges,
+)
+
 
 _SYNTHETIC_PROTOCOL = "continuous_variable_gamma_mixture_v1"
+
+
+def _score_metric(metric: str) -> str:
+    metric = canonical_metric_name(metric)
+    if metric not in ("l2", "w2"):
+        raise ValueError("Truth proper scores support metric='l2' or metric='w2'.")
+    return metric
+
+
+def _score_distances(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    *,
+    metric: str,
+    log_rate_edges: torch.Tensor | None,
+    chunk_size: int,
+) -> torch.Tensor:
+    if _score_metric(metric) == "w2":
+        if log_rate_edges is None:
+            raise ValueError("metric='w2' requires log_rate_edges.")
+        return pairwise_w2_exact(left, right, log_rate_edges, chunk_size=chunk_size)
+    return pairwise_distances(left, right, metric="l2", chunk_size=chunk_size)
+
+
+def _distance_metadata(metric: str) -> dict[str, Any]:
+    return {
+        "metric": metric,
+        "ground_metric": metric,
+        "distance_protocol_version": (
+            W2_EXACT_PROTOCOL_VERSION if metric == "w2"
+            else DISTANCE_PROTOCOL_VERSION
+        ),
+        "ground_distance": (
+            "unsquared_w2_of_piecewise_uniform_natural_log_rate_histograms"
+            if metric == "w2" else "unsquared_l2_of_normalized_histogram_bin_masses"
+        ),
+        "distance_computation": (
+            "exact_piecewise_uniform_inverse_cdf_integration" if metric == "w2"
+            else "exact_euclidean_norm"
+        ),
+        "distance_squared": False,
+        "quantile_quadrature_used": False,
+    }
+
+
+def _resolved_log_rate_edges(
+    samples_artifact: Mapping[str, Any],
+    truth_artifact: Mapping[str, Any] | None,
+) -> torch.Tensor:
+    """Derive the canonical grid and reject conflicting stored grid evidence."""
+
+    spec = ContinuousNMRSpec.from_dict(dict(samples_artifact["specification"]))
+    expected = build_nmr_grid(spec).as_artifact()
+    for name, artifact in (("samples artifact", samples_artifact), ("truth artifact", truth_artifact)):
+        if artifact is None or "grid" not in artifact:
+            continue
+        grid = artifact["grid"]
+        if not isinstance(grid, Mapping):
+            raise ValueError(f"{name}.grid must be a mapping.")
+        if grid.get("specification_hash") != spec.specification_hash:
+            raise ValueError(f"{name}.grid specification hash differs from the specification.")
+        for field, canonical in expected.items():
+            if not isinstance(canonical, torch.Tensor):
+                continue
+            value = grid.get(field)
+            if not isinstance(value, torch.Tensor) or value.shape != canonical.shape:
+                raise ValueError(f"{name}.grid[{field!r}] has an invalid shape or is missing.")
+            if field == "log_rate_edges":
+                validate_log_rate_edges(value, num_bins=spec.num_spectrum_bins)
+            tolerance = 1.0e-12 if canonical.is_floating_point() else 0.0
+            if not torch.allclose(
+                value.detach().cpu().to(torch.float64), canonical.to(torch.float64),
+                rtol=0.0, atol=tolerance,
+            ):
+                raise ValueError(f"{name}.grid[{field!r}] differs from the specification.")
+    return expected["log_rate_edges"]
 
 
 def _artifact_protocol(artifact: Mapping[str, Any], name: str) -> tuple[str, str]:
@@ -90,9 +177,11 @@ def _compute_truth_score_report(
     point_iid_assumption: str,
     score_one: Callable[..., dict[str, Any]],
     prepare_score: Callable[[], dict[str, Any]] | None = None,
+    metric: str = "l2",
 ) -> dict[str, Any]:
     """Validate aligned artifacts before optional preparation or scoring."""
 
+    metric = _score_metric(metric)
     protocol, specification_hash = _artifact_protocol(samples_artifact, "samples artifact")
     samples = samples_artifact.get("samples")
     if not isinstance(samples, torch.Tensor) or samples.ndim != 3 or min(samples.shape) < 1:
@@ -137,6 +226,17 @@ def _compute_truth_score_report(
     }
     if protocol != _SYNTHETIC_PROTOCOL:
         raise ValueError(f"Truth {score_name} scoring supports the declared synthetic protocol only.")
+    log_rate_edges = None
+    if metric == "w2":
+        log_rate_edges = _resolved_log_rate_edges(samples_artifact, None)
+        if samples.shape[-1] != log_rate_edges.numel() - 1:
+            raise ValueError("Prediction histogram size differs from the specification.")
+        report.update({
+            "log_rate_edges": log_rate_edges.tolist(),
+            "log_rate_coordinate": "natural_log_rate",
+            "histogram_interpretation": "constant_density_within_each_natural_log_rate_bin",
+            "grid_source": "specification_validated_against_present_artifact_grids",
+        })
     if truth_artifact is None:
         return {
             **report,
@@ -147,6 +247,8 @@ def _compute_truth_score_report(
     truth_protocol, truth_hash = _artifact_protocol(truth_artifact, "truth artifact")
     if (protocol, specification_hash) != (truth_protocol, truth_hash):
         raise ValueError("Prediction and truth protocol/specification hashes differ.")
+    if metric == "w2":
+        log_rate_edges = _resolved_log_rate_edges(samples_artifact, truth_artifact).to(device)
     specification = samples_artifact["specification"]
     if samples.shape[2] != specification.get("num_spectrum_bins"):
         raise ValueError("Prediction histogram size differs from the specification.")
@@ -198,6 +300,7 @@ def _compute_truth_score_report(
         score = score_one(
             samples[index, :sample_count].to(device), truth[index].to(device),
             deterministic=deterministic, distance_chunk_size=distance_chunk_size,
+            metric=metric, log_rate_edges=log_rate_edges,
         )
         if not score["available"]:
             return {
@@ -219,4 +322,3 @@ def _compute_truth_score_report(
         "per_condition": records,
         "aggregate": _condition_aggregate(records, terms),
     }
-

@@ -8,18 +8,22 @@ does not use an image feature extractor and has no dependency on the legacy
 from .distances import (
     DISTANCE_PROTOCOL_VERSION,
     GROUND_METRICS,
+    W2_EXACT_PROTOCOL_VERSION,
     canonical_metric_name,
     histograms_to_quantiles,
     pairwise_distances,
+    pairwise_w2_exact,
     validate_log_rate_edges,
 )
 from .energy_score import (
     ENERGY_SCORE_PROTOCOL_VERSION,
+    W2_ENERGY_SCORE_PROTOCOL_VERSION,
     compute_energy_score_report,
     histogram_l2_energy_score,
 )
 from .kernel_score import (
     KERNEL_SCORE_PROTOCOL_VERSION,
+    W2_KERNEL_SCORE_PROTOCOL_VERSION,
     compute_kernel_score_report,
     histogram_gaussian_kernel_score,
 )
@@ -55,6 +59,9 @@ __all__ = [
     "DISTANCE_PROTOCOL_VERSION",
     "ENERGY_SCORE_PROTOCOL_VERSION",
     "KERNEL_SCORE_PROTOCOL_VERSION",
+    "W2_EXACT_PROTOCOL_VERSION",
+    "W2_ENERGY_SCORE_PROTOCOL_VERSION",
+    "W2_KERNEL_SCORE_PROTOCOL_VERSION",
     "GROUND_METRICS",
     "METRIC_PROTOCOL_VERSION",
     "PRDC_PROTOCOL_VERSION",
@@ -77,6 +84,7 @@ __all__ = [
     "histogram_gaussian_kernel_score",
     "kth_neighbour_radii",
     "pairwise_distances",
+    "pairwise_w2_exact",
     "rate_window_fractions",
     "sample_set_diagnostics",
     "summarize_derived_quantities",

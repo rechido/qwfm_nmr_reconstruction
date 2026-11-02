@@ -21,7 +21,7 @@ class NMRGrid:
     log_rate_edges: torch.Tensor
     rate_edges: torch.Tensor
     rate_centers: torch.Tensor
-    echo_times_64: torch.Tensor
+    canonical_echo_times: torch.Tensor
     echo_subset_indices: torch.Tensor
     echo_times: torch.Tensor
     kernel: torch.Tensor
@@ -39,7 +39,7 @@ class NMRGrid:
             "log_rate_edges": self.log_rate_edges.cpu(),
             "rate_edges": self.rate_edges.cpu(),
             "rate_centers": self.rate_centers.cpu(),
-            "echo_times_64": self.echo_times_64.cpu(),
+            f"echo_times_{self.canonical_echo_times.numel()}": self.canonical_echo_times.cpu(),
             "echo_subset_indices": self.echo_subset_indices.cpu(),
             "echo_times": self.echo_times.cpu(),
             "kernel": self.kernel.cpu(),
@@ -64,24 +64,24 @@ def build_nmr_grid(
     )
     rate_edges = log_rate_edges.exp()
     rate_centers = torch.exp(0.5 * (log_rate_edges[:-1] + log_rate_edges[1:]))
-    echo_times_64 = torch.logspace(
+    canonical_echo_times = torch.logspace(
         math.log10(spec.echo_time_minimum),
         math.log10(spec.echo_time_maximum),
         spec.canonical_echo_count,
         dtype=dtype,
         device=device,
     )
-    if spec.num_measurements == 64:
-        indices = torch.arange(64, dtype=torch.int64, device=device)
-    else:
+    if spec.num_measurements == 32:
         indices = torch.tensor(M32_SUBSET_INDICES, dtype=torch.int64, device=device)
-    echo_times = echo_times_64.index_select(0, indices)
+    else:
+        indices = torch.arange(spec.num_measurements, dtype=torch.int64, device=device)
+    echo_times = canonical_echo_times.index_select(0, indices)
     kernel = torch.exp(-echo_times[:, None] * rate_centers[None, :])
     return NMRGrid(
         log_rate_edges=log_rate_edges,
         rate_edges=rate_edges,
         rate_centers=rate_centers,
-        echo_times_64=echo_times_64,
+        canonical_echo_times=canonical_echo_times,
         echo_subset_indices=indices,
         echo_times=echo_times,
         kernel=kernel,

@@ -49,15 +49,6 @@ from codes.utils.io_utils import atomic_write_json, load_torch_artifact
 RAW_FILENAME = "evaluation_raw.json"
 SUMMARY_FILENAME = "evaluation_summary.json"
 EVALUATION_PROTOCOL_VERSION = "saved_samples_reference_oracle_v1"
-_GRID_TENSOR_FIELDS = (
-    "log_rate_edges",
-    "rate_edges",
-    "rate_centers",
-    "echo_times_64",
-    "echo_subset_indices",
-    "echo_times",
-    "kernel",
-)
 
 
 @dataclass(frozen=True)
@@ -155,9 +146,10 @@ def _validate_grid(
     expected_hash = expected_grid["specification_hash"]
     if grid.get("specification_hash") != expected_hash:
         raise ValueError(f"{artifact_name}.grid specification hash differs.")
-    for field in _GRID_TENSOR_FIELDS:
+    for field, expected in expected_grid.items():
+        if not isinstance(expected, torch.Tensor):
+            continue
         value = _required(grid, field, f"{artifact_name}.grid")
-        expected = expected_grid[field]
         if not isinstance(value, torch.Tensor):
             raise ValueError(f"{artifact_name}.grid[{field!r}] must be a tensor.")
         tolerance = 0.0 if not expected.is_floating_point() else 1.0e-12

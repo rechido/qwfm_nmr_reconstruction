@@ -20,9 +20,10 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader
 
-CODES_DIR = Path(__file__).resolve().parents[1]
-if str(CODES_DIR) not in sys.path:
-    sys.path.insert(0, str(CODES_DIR))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+for source_root in (PROJECT_ROOT, PROJECT_ROOT / "codes"):
+    if str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
 
 from data.simulator import ContinuousGammaMixtureDataset
 from data.spec import ContinuousNMRSpec
@@ -36,6 +37,7 @@ from utils.predictive_generation_utils import (
     file_sha256,
 )
 from utils.proper_score_conditions import load_proper_score_truth, validate_proper_score_truth
+from utils.model_variant_utils import experiment_dimensions
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -45,9 +47,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num_conditions", type=int, default=16384)
     parser.add_argument("--num_posterior_samples", type=int, default=8,
                         help="Used only to name the shared run directory; no model samples are generated.")
-    parser.add_argument("--num_measurements", type=int, choices=(32, 64),
-                        help="Inferred from experiment_dir name m32n128 or m64n128 when omitted.")
-    parser.add_argument("--num_spectrum_bins", type=int, default=128)
+    parser.add_argument("--num_measurements", type=int, choices=(32, 64, 128),
+                        help="Inferred from experiment_dir name m<M>n<N> when omitted.")
+    parser.add_argument("--num_spectrum_bins", type=int,
+                        help="Inferred from experiment_dir name m<M>n<N>; otherwise defaults to 128.")
     parser.add_argument("--test_dataset_seed", type=int, default=2026092901)
     parser.add_argument("--condition_batch_size", type=int, default=256)
     parser.add_argument("--num_cpu_threads", type=int, default=2)
@@ -64,11 +67,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             or args.progress_interval_seconds <= 0):
         parser.error("progress_interval_seconds must be finite and positive.")
     args.experiment_dir = args.experiment_dir.expanduser().resolve()
+    try:
+        dimensions = experiment_dimensions(args.experiment_dir)
+    except ValueError:
+        dimensions = None
     if args.num_measurements is None:
-        experiments = {"m32n128": 32, "m64n128": 64}
-        if args.experiment_dir.name not in experiments:
-            parser.error("Use experiment_dir named m32n128/m64n128, or supply --num_measurements.")
-        args.num_measurements = experiments[args.experiment_dir.name]
+        if dimensions is None:
+            parser.error("Use experiment_dir named m<M>n<N>, or supply --num_measurements.")
+        args.num_measurements = dimensions[0]
+    if args.num_spectrum_bins is None:
+        args.num_spectrum_bins = dimensions[1] if dimensions is not None else 128
     try:
         args.spec = ContinuousNMRSpec(num_measurements=args.num_measurements,
                                       num_spectrum_bins=args.num_spectrum_bins)

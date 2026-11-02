@@ -5,6 +5,8 @@ the reference-posterior implementation.  A spectrum is represented by the
 probability mass in bins that are uniform on the natural-log-rate coordinate.
 Consequently, ``w1`` and ``w2`` below compare distributions on log rate rather
 than treating the bin-mass vector as an unstructured image.
+``pairwise_w2_exact`` additionally integrates the piecewise-linear inverse
+CDFs exactly; the existing ``w2`` metric keeps its midpoint approximation.
 
 All public pairwise functions accept either two sample sets, ``[S, N]`` and
 ``[T, N]``, or two equally grouped sets, ``[G, S, N]`` and ``[G, T, N]``.
@@ -24,6 +26,7 @@ import torch
 
 GROUND_METRICS: Final[tuple[str, ...]] = ("l2", "w1", "w2")
 DISTANCE_PROTOCOL_VERSION: Final[str] = "nmr_log_rate_ground_distances_v1"
+W2_EXACT_PROTOCOL_VERSION: Final[str] = "nmr_log_rate_w2_exact_piecewise_uniform_v1"
 _METRIC_ALIASES: Final[dict[str, str]] = {
     "l2": "l2",
     "histogram_l2": "l2",
@@ -308,6 +311,139 @@ def _pairwise_w2_2d(
     ) / math.sqrt(float(num_quantiles))
 
 
+def _exact_w2_cdf(histograms: torch.Tensor) -> torch.Tensor:
+    """Build monotone float64 CDFs, retaining repeated boundaries of empty bins."""
+
+    mass = _normalized_work_histograms(histograms)
+    cumulative = mass.cumsum(dim=-1)
+    # Normalizing by the accumulated total also makes trailing empty bins end
+    # at exactly one. Assigning only the final boundary can otherwise create
+    # a spurious probability interval in an empty bin through rounding.
+    cumulative = cumulative / cumulative[:, -1:]
+    return torch.cat((torch.zeros_like(cumulative[:, :1]), cumulative), dim=-1)
+
+
+def _quantile_interval_endpoints(
+    cdf: torch.Tensor,
+    edges: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate each interval with its own bin, including one-sided endpoints."""
+
+    # Every positive merged interval lies in a single positive-mass bin. Its
+    # upper endpoint, searched from the left, selects that bin even when the
+    # endpoint touches a run of empty bins. Midpoint lookup is unsafe for
+    # intervals so small that their floating-point midpoint equals an edge.
+    indices = torch.searchsorted(cdf, upper.contiguous(), right=False) - 1
+    indices.clamp_(0, cdf.shape[-1] - 2)
+    cdf_lower = cdf.gather(-1, indices)
+    cdf_width = cdf.gather(-1, indices + 1) - cdf_lower
+    # Zero-width merged intervals have zero contribution; use a harmless
+    # denominator for their arbitrary quantile endpoint values.
+    denominator = torch.where(cdf_width > 0.0, cdf_width, 1.0)
+    fraction_lower = ((lower - cdf_lower) / denominator).clamp_(0.0, 1.0)
+    fraction_upper = ((upper - cdf_lower) / denominator).clamp_(0.0, 1.0)
+    edge_lower = edges[indices]
+    edge_width = edges[indices + 1] - edge_lower
+    return (
+        edge_lower + fraction_lower * edge_width,
+        edge_lower + fraction_upper * edge_width,
+    )
+
+
+def _pairwise_w2_exact_2d(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    log_rate_edges: torch.Tensor,
+    *,
+    chunk_size: int | None,
+) -> torch.Tensor:
+    left_count, right_count = int(left.shape[0]), int(right.shape[0])
+    resolved_chunk = _validated_chunk_size(chunk_size, left_count, right_count)
+    left_cdf = _exact_w2_cdf(left)
+    right_cdf = _exact_w2_cdf(right)
+    edges = log_rate_edges.to(dtype=torch.float64)
+    result = torch.empty(
+        (left_count, right_count), device=left.device, dtype=torch.float64
+    )
+    for left_start in range(0, left_count, resolved_chunk):
+        left_stop = min(left_start + resolved_chunk, left_count)
+        for right_start in range(0, right_count, resolved_chunk):
+            right_stop = min(right_start + resolved_chunk, right_count)
+            block_shape = (left_stop - left_start, right_stop - right_start, -1)
+            block_left = left_cdf[left_start:left_stop, None, :].expand(
+                *block_shape
+            ).reshape(-1, left_cdf.shape[-1]).contiguous()
+            block_right = right_cdf[None, right_start:right_stop, :].expand(
+                *block_shape
+            ).reshape(-1, right_cdf.shape[-1]).contiguous()
+            boundaries = torch.cat((block_left, block_right), dim=-1).sort(-1).values
+            lower, upper = boundaries[:, :-1], boundaries[:, 1:]
+            left_lower, left_upper = _quantile_interval_endpoints(
+                block_left, edges, lower, upper
+            )
+            right_lower, right_upper = _quantile_interval_endpoints(
+                block_right, edges, lower, upper
+            )
+            difference_lower = left_lower - right_lower
+            difference_upper = left_upper - right_upper
+            # For a linear difference with endpoint values a,b, the integral
+            # of its square is width * (a*a + a*b + b*b) / 3. This equivalent
+            # sum-of-squares form avoids cancellation when a and b differ in sign.
+            integral = (upper - lower) * (
+                difference_lower.square()
+                + difference_upper.square()
+                + (difference_lower + difference_upper).square()
+            ) / 6.0
+            result[left_start:left_stop, right_start:right_stop] = (
+                integral.sum(-1).clamp_min_(0.0).sqrt_().reshape(*block_shape[:2])
+            )
+    return result
+
+
+def pairwise_w2_exact(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    log_rate_edges: torch.Tensor,
+    *,
+    chunk_size: int | None = 64,
+) -> torch.Tensor:
+    """Return exact, unsquared 1D W2 between piecewise-uniform histograms.
+
+    Inputs have shape ``[S,N]``/``[T,N]`` or ``[G,S,N]``/``[G,T,N]`` and
+    contain unit bin masses on the supplied natural-log-rate edges. Accepted
+    rounding error in row sums is normalized in float64. Output has shape
+    ``[S,T]`` or ``[G,S,T]``, float64 dtype, and the input device.
+
+    The squared difference of inverse CDFs is integrated analytically over
+    their merged probability breakpoints, then square-rooted. Empty bins and
+    the resulting quantile jumps are supported. Pair chunks bound temporary
+    storage by ``O(chunk_size**2 * N)``. ``pairwise_distances(metric="w2")``
+    continues to use its existing midpoint approximation.
+    """
+
+    _validate_pair(left, right)
+    edges = validate_log_rate_edges(log_rate_edges, num_bins=int(left.shape[-1]))
+    if edges.device != left.device:
+        raise ValueError("histograms and log_rate_edges must be on the same device.")
+    _validated_chunk_size(chunk_size, int(left.shape[-2]), int(right.shape[-2]))
+    if left.ndim == 3:
+        return torch.stack(
+            [
+                _pairwise_w2_exact_2d(
+                    left[group_index],
+                    right[group_index],
+                    edges,
+                    chunk_size=chunk_size,
+                )
+                for group_index in range(int(left.shape[0]))
+            ],
+            dim=0,
+        )
+    return _pairwise_w2_exact_2d(left, right, edges, chunk_size=chunk_size)
+
+
 def pairwise_distances(
     left: torch.Tensor,
     right: torch.Tensor,
@@ -368,8 +504,10 @@ def pairwise_distances(
 __all__ = [
     "DISTANCE_PROTOCOL_VERSION",
     "GROUND_METRICS",
+    "W2_EXACT_PROTOCOL_VERSION",
     "canonical_metric_name",
     "histograms_to_quantiles",
     "pairwise_distances",
+    "pairwise_w2_exact",
     "validate_log_rate_edges",
 ]

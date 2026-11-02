@@ -21,9 +21,10 @@ import torch
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 
-CODES_DIR = Path(__file__).resolve().parents[1]
-if str(CODES_DIR) not in sys.path:
-    sys.path.insert(0, str(CODES_DIR))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+for source_root in (PROJECT_ROOT, PROJECT_ROOT / "codes"):
+    if str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
 
 from utils.io_utils import atomic_write_json
 from utils.model_variant_utils import FLOW_METHODS, VARIANTS, resolve_training_dir
@@ -38,6 +39,10 @@ from utils.predictive_generation_utils import (
 from utils.predictive_model_utils import PredictiveModel, inspect_training_model
 from utils.proper_score_conditions import load_proper_score_truth
 from utils.proper_score_locks import model_generation_lock
+from utils.quantile_decoder_artifacts import (
+    decoder_comparison_metadata, validate_saved_quantiles,
+)
+from utils.nmr_utils import qwfm_decoder_signature
 
 
 PROTOCOL = PROPER_SCORE_PROTOCOL_VERSION
@@ -50,6 +55,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--variant", choices=tuple(VARIANTS), required=True)
     parser.add_argument("--training_dir", type=Path)
     parser.add_argument("--run_dir", type=Path)
+    parser.add_argument("--save_quantiles", type=parse_bool, default=False,
+                        help="QWFM only: also save final quantiles for offline paired decoder comparisons.")
     parser.add_argument("--num_conditions", type=int, default=16384)
     parser.add_argument("--num_posterior_samples", type=int, default=8)
     parser.add_argument("--eval_ode_steps", type=_positive_list,
@@ -82,6 +89,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if not math.isfinite(args.progress_interval_seconds) or args.progress_interval_seconds <= 0:
         parser.error("progress_interval_seconds must be finite and positive.")
     method = VARIANTS[args.variant][0]
+    if args.save_quantiles and method != "quantile_wasserstein":
+        parser.error("--save_quantiles is supported only for QWFM.")
     args.eval_ode_steps = args.eval_ode_steps or ((256,) if method in FLOW_METHODS else (1,))
     if method not in FLOW_METHODS and args.eval_ode_steps != (1,):
         parser.error("This model has no ODE integration; --eval_ode_steps must be 1.")
@@ -125,7 +134,12 @@ def _as_reference(truth: dict[str, Any]) -> dict[str, Any]:
 
 
 def validate_sample_cache(artifact: dict[str, Any], truth: dict[str, Any], expected: dict[str, Any]) -> None:
-    if artifact.get("proper_score_provenance") != expected:
+    provenance = dict(artifact.get("proper_score_provenance", {}))
+    if expected.get("saved_quantiles"):
+        validate_saved_quantiles(artifact)
+        if provenance.pop("quantile_sha256", None) != artifact["quantile_sha256"]:
+            raise ValueError("Quantile provenance is inconsistent.")
+    if provenance != expected:
         raise ValueError("Cached predictions have different checkpoint, seed, or sampling settings.")
     if artifact.get("specification_hash") != truth["specification_hash"]:
         raise ValueError("Cached predictions use a different simulator.")
@@ -160,6 +174,8 @@ def _generate_job(args: argparse.Namespace, accelerator: Accelerator, name: str,
         "world_size": accelerator.num_processes, "eval_batch_size": batch_size,
         "mixed_precision": args.mixed_precision, "max_decode_batch_size": args.max_decode_batch_size,
     }
+    if args.save_quantiles:
+        expected.update(saved_quantiles=True, decoder_signature=qwfm_decoder_signature("hard_bin"))
     manifest = _manifest(args.run_dir)
     for field, value in (("num_conditions", count), ("requested_sample_count", args.num_posterior_samples),
                          ("conditions_sha256", truth_hash), ("specification_hash", info["spec"].specification_hash)):
@@ -171,7 +187,7 @@ def _generate_job(args: argparse.Namespace, accelerator: Accelerator, name: str,
         accelerator.print(f"reuse: {key} G={count} K={stored_k} (no new inference)", flush=True)
     else:
         accelerator.print(f"generate: {key} G={count} K={stored_k}, conditions/rank={count//accelerator.num_processes}, batch/rank={batch_size}", flush=True)
-        batches, id_batches = [], []
+        batches, id_batches, quantile_batches = [], [], []
         start = time.perf_counter()
         accelerator.print(f"{key}: loading model...", flush=True)
         sampler = _collective(
@@ -187,17 +203,29 @@ def _generate_job(args: argparse.Namespace, accelerator: Accelerator, name: str,
         progress = _GenerationProgress(accelerator, f"{key} sampling", count,
                                        args.progress_every, args.progress_interval_seconds)
         for step, batch in enumerate(loader):
+            sample_options = {"return_quantiles": True} if args.save_quantiles else {}
             with torch.inference_mode(), accelerator.autocast():
-                samples = _collective(
+                result = _collective(
                     accelerator,
-                    lambda: sampler.sample(batch["measurement"], num_samples=stored_k, nfe=nfe),
+                    lambda: sampler.sample(batch["measurement"], num_samples=stored_k, nfe=nfe,
+                                           **sample_options),
                     f"sample {key} batch {step}",
                 )
+            if args.save_quantiles:
+                samples, quantiles = result
+            else:
+                samples = result
             local_count += len(samples)
-            gathered, ids = accelerator.gather_for_metrics((samples, batch["condition_id"]))
+            if args.save_quantiles:
+                gathered, ids, gathered_quantiles = accelerator.gather_for_metrics(
+                    (samples, batch["condition_id"], quantiles))
+            else:
+                gathered, ids = accelerator.gather_for_metrics((samples, batch["condition_id"]))
             if accelerator.is_main_process:
                 batches.append(gathered.detach().cpu().float())
                 id_batches.append(ids.detach().cpu())
+                if args.save_quantiles:
+                    quantile_batches.append(gathered_quantiles.detach().cpu().float())
             progress.update(local_count * accelerator.num_processes, step + 1)
         rank_counts = accelerator.gather(torch.tensor([local_count], device=accelerator.device)).cpu().tolist()
         if rank_counts != [count // accelerator.num_processes] * accelerator.num_processes:
@@ -230,6 +258,15 @@ def _generate_job(args: argparse.Namespace, accelerator: Accelerator, name: str,
                             truth_source="independent_simulator_joint_pairs",
                             posterior_reference_samples_used=False,
                             requested_num_samples_per_condition=args.num_posterior_samples)
+            if args.save_quantiles:
+                quantiles = torch.cat(quantile_batches)[order]
+                metadata = decoder_comparison_metadata(quantiles, "hard_bin")
+                artifact.update(quantiles=quantiles, quantile_sha256=metadata["quantile_sha256"],
+                                decoder_comparison=metadata)
+                artifact["sampling_config"]["histogram_decoder"] = metadata["decoder_signature"]
+                artifact["proper_score_provenance"] = {
+                    **expected, "quantile_sha256": metadata["quantile_sha256"],
+                }
             validate_sample_cache(artifact, truth, expected)
             _save_cache(path, artifact)
 

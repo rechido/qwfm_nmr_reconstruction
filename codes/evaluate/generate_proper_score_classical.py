@@ -33,6 +33,7 @@ from codes.evaluate.generate_proper_score_samples import (
     validate_sample_cache,
 )
 from codes.utils.proper_score_conditions import load_proper_score_truth
+from codes.utils.model_variant_utils import experiment_dimensions
 from codes.utils.proper_score_locks import model_generation_lock
 from codes.utils.classical_baseline_utils import (
     CLASSICAL_BASELINE_PROTOCOL_VERSION,
@@ -90,8 +91,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ):
         parser.error("regularization_maximum must exceed regularization_minimum.")
     args.experiment_dir = args.experiment_dir.expanduser().resolve()
-    if args.experiment_dir.name not in ("m32n128", "m64n128"):
-        parser.error("Independent truth scores require the synthetic m32n128 or m64n128 experiment.")
+    try:
+        experiment_dimensions(args.experiment_dir)
+    except ValueError as error:
+        parser.error(str(error))
     args.run_dir = (args.run_dir or args.experiment_dir / "proper_scores" /
                     f"g{args.num_conditions}_k{args.num_posterior_samples}").expanduser().resolve()
     return args
@@ -104,9 +107,7 @@ def _load_conditions(args: argparse.Namespace) -> tuple[dict, ContinuousNMRSpec,
         test_dataset_seed=args.test_dataset_seed,
     )
     spec = ContinuousNMRSpec.from_dict(truth["specification"])
-    if (spec.num_measurements, spec.num_spectrum_bins) != (
-        int(args.experiment_dir.name[1:3]), 128
-    ):
+    if (spec.num_measurements, spec.num_spectrum_bins) != experiment_dimensions(args.experiment_dir):
         raise ValueError("Shared truth simulator does not match the requested synthetic experiment.")
     return truth, spec, path
 

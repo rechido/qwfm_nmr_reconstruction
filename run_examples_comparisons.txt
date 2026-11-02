@@ -1,0 +1,8 @@
+# Level 3: comparisons across all three settings.
+# Run after each setting's four model pipelines have finished.
+# Values are fixed inside the script; no command-line arguments are needed.
+# Only saved evaluation reports are read. No neural inference or sample generation.
+bash scripts/paper/90_export_results.sh
+
+# Optional, independent of all experiments: illustrate histogram/quantile interpolation.
+bash scripts/paper/92_plot_transport_paths.sh

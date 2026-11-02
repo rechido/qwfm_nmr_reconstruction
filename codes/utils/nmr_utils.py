@@ -262,6 +262,121 @@ def quantiles_to_histograms(
     return histograms
 
 
+def qwfm_decoder_signature(decoder: str = "hard_bin") -> dict[str, str]:
+    """Identify an evaluation decoder without changing the checkpoint contract.
+
+    Training states and their midpoint probability grid are identical for both
+    decoders.  This signature belongs to prediction artifacts, not checkpoints.
+    """
+
+    if decoder not in ("hard_bin", "linear_cdf"):
+        raise ValueError("decoder must be 'hard_bin' or 'linear_cdf'.")
+    signature = {
+        "decoder": decoder,
+        "protocol_version": f"qwfm_{decoder}_evaluation_v1",
+        "quantile_probability_grid": "midpoints_(index+0.5)/num_quantiles",
+        "internal_edge_policy": "right_bin_and_upper_endpoint_to_last_bin",
+    }
+    if decoder == "hard_bin":
+        signature["histogram_decoder"] = "equal_mass_bin_edge_hard_assignment"
+    else:
+        signature.update({
+            "histogram_decoder": "piecewise_linear_quantile_cdf_bin_differences",
+            "tail_rule": "endpoint_knots_from_half_step_extrapolation_clipped_to_support",
+            "ties": "quantile_plateaus_retained_as_atoms_without_jitter",
+            "single_quantile": "point_mass",
+        })
+    return signature
+
+
+def quantiles_to_histograms_linear_cdf(
+    quantiles: torch.Tensor,
+    log_rate_edges: torch.Tensor,
+) -> torch.Tensor:
+    """Bin the distribution defined by a piecewise-linear quantile interpolant.
+
+    For midpoint levels ``u_l=(l+0.5)/L``, interpolate the supplied ordered
+    quantiles linearly in ``u``.  Append endpoint knots at probabilities 0 and 1
+    by extrapolating the adjacent segment for half a grid step, then clipping
+    those two knot positions to the supplied support.  A single quantile defines
+    a point mass.  These are explicit interpolation/tail assumptions, not an
+    exact inverse of finite midpoint encoding or a smoothing guarantee.
+
+    Equal adjacent quantiles define atoms and are not deduplicated or jittered.
+    Evaluate ``P(Q(U) < edge)`` at internal edges so atoms on a boundary belong
+    to its right bin.  The last bin includes the upper support endpoint.  All
+    CDF arithmetic is float64; output preserves the input dtype and device.
+    """
+
+    if not isinstance(quantiles, torch.Tensor):
+        raise TypeError("quantiles must be a torch.Tensor.")
+    if quantiles.ndim != 2 or quantiles.shape[1] < 1:
+        raise ValueError("quantiles must have shape [batch, quantiles] with L >= 1.")
+    if not quantiles.is_floating_point():
+        raise TypeError("quantiles must have a floating-point dtype.")
+    if not isinstance(log_rate_edges, torch.Tensor):
+        raise TypeError("log_rate_edges must be a torch.Tensor.")
+    if log_rate_edges.ndim != 1 or log_rate_edges.numel() < 3:
+        raise ValueError("log_rate_edges must contain at least three one-dimensional edges.")
+    if not log_rate_edges.is_floating_point():
+        raise TypeError("log_rate_edges must have a floating-point dtype.")
+    values = quantiles.to(torch.float64)
+    edges = log_rate_edges.to(device=values.device, dtype=torch.float64).contiguous()
+    if not bool(torch.isfinite(edges).all()) or bool((torch.diff(edges) <= 0).any()):
+        raise ValueError("log_rate_edges must be finite and strictly increasing.")
+    if not bool(torch.isfinite(values).all()):
+        raise ValueError("quantiles must contain only finite values.")
+    if bool((values[:, 1:] < values[:, :-1]).any()):
+        raise ValueError("linear_cdf requires nondecreasing quantiles.")
+    if bool((values < edges[0]).any()) or bool((values > edges[-1]).any()):
+        raise ValueError("quantiles must lie inside the supplied edge domain.")
+    if values.shape[0] == 0:
+        return quantiles.new_empty((0, edges.numel() - 1))
+
+    count = values.shape[1]
+    if count == 1:
+        # Exact boundary assignment for the degenerate, single-atom case.
+        return quantiles_to_histograms(values, edges).to(quantiles.dtype)
+    left = (values[:, :1] - 0.5 * (values[:, 1:2] - values[:, :1])).clamp_min(edges[0])
+    right = (values[:, -1:] + 0.5 * (values[:, -1:] - values[:, -2:-1])).clamp_max(edges[-1])
+    knots = torch.cat((left, values, right), dim=1).contiguous()
+    levels = torch.cat((
+        values.new_zeros(1),
+        (torch.arange(count, device=values.device, dtype=torch.float64) + 0.5) / count,
+        values.new_ones(1),
+    ))
+    boundaries = edges[None, :].expand(values.shape[0], -1).contiguous()
+    # lower_bound selects the beginning of a plateau, yielding the left-limit
+    # CDF rather than incorrectly placing boundary atoms into the left bin.
+    index = torch.searchsorted(knots, boundaries, right=False)
+    interval = index.clamp(1, knots.shape[1] - 1)
+    q_left = knots.gather(1, interval - 1)
+    q_right = knots.gather(1, interval)
+    width = q_right - q_left
+    fraction = (boundaries - q_left) / torch.where(width > 0, width, torch.ones_like(width))
+    cdf = levels[interval - 1] + fraction.clamp(0, 1) * (levels[interval] - levels[interval - 1])
+    cdf = torch.where(index == 0, torch.zeros_like(cdf), cdf)
+    cdf = torch.where(index == knots.shape[1], torch.ones_like(cdf), cdf)
+    cdf[:, 0] = 0.0
+    cdf[:, -1] = 1.0
+    masses = torch.diff(cdf, dim=1).clamp_min(0.0)
+    masses = masses / masses.sum(dim=1, keepdim=True)
+    return masses.to(dtype=quantiles.dtype)
+
+
+def decode_quantiles(
+    quantiles: torch.Tensor,
+    log_rate_edges: torch.Tensor,
+    decoder: str = "hard_bin",
+) -> torch.Tensor:
+    """Select an evaluation decoder while keeping legacy hard binning default."""
+
+    qwfm_decoder_signature(decoder)
+    if decoder == "linear_cdf":
+        return quantiles_to_histograms_linear_cdf(quantiles, log_rate_edges)
+    return quantiles_to_histograms(quantiles, log_rate_edges)
+
+
 def histogram_w1(
     first: torch.Tensor,
     second: torch.Tensor,

@@ -219,11 +219,19 @@ class PredictiveModel:
         num_samples: int,
         nfe: int = 1,
         source_seed: int | None = None,
-    ) -> torch.Tensor:
-        """Return [B,K,N], or the single unique [B,1,N] regression prediction."""
+        return_quantiles: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Return histograms, optionally paired with QWFM terminal quantiles.
+
+        The default is unchanged: [B,K,N] histograms (one for regression).
+        ``return_quantiles=True`` is QWFM-only and returns ``(histograms,
+        quantiles)`` with the latter shaped [B,K,L].
+        """
 
         _positive_integer(num_samples, "num_samples")
         _positive_integer(nfe, "nfe")
+        if return_quantiles and self.method != "quantile_wasserstein":
+            raise ValueError("return_quantiles is only supported by QWFM.")
         if self.method not in _FLOW_METHODS and nfe != 1:
             raise ValueError("Only flow-matching samplers support nfe other than 1.")
         if (not isinstance(measurements, torch.Tensor) or measurements.ndim != 2
@@ -245,13 +253,22 @@ class PredictiveModel:
             options["num_ode_steps"] = nfe
         elif self.method == "conditional_vae":
             options["generator"] = self.generator
+        if return_quantiles:
+            options["return_quantiles"] = True
         with self.accelerator.autocast():
-            samples, _ = self.sampler.sample(condition, **options)
+            samples, extras = self.sampler.sample(condition, **options)
         expected = (measurements.shape[0], 1 if self.deterministic else num_samples,
                     self.args.num_spectrum_bins)
         if tuple(samples.shape) != expected or not bool(torch.isfinite(samples).all()):
             raise RuntimeError("Sampler returned an invalid spectrum tensor.")
-        return samples.detach().to(dtype=torch.float32)
+        samples = samples.detach().to(dtype=torch.float32)
+        if return_quantiles:
+            quantiles = extras["quantiles"].detach().to(dtype=torch.float32)
+            expected_quantiles = (measurements.shape[0], num_samples, self.info["state_size"])
+            if tuple(quantiles.shape) != expected_quantiles or not bool(torch.isfinite(quantiles).all()):
+                raise RuntimeError("Sampler returned an invalid quantile tensor.")
+            return samples, quantiles
+        return samples
 
 
 def _positive_integer(value: int, name: str) -> None:

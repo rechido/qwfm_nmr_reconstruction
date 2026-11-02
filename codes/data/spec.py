@@ -22,7 +22,7 @@ class ContinuousNMRSpec:
     rate_maximum: float = 250.0
     echo_time_minimum: float = 0.008
     echo_time_maximum: float = 0.512
-    canonical_echo_count: int = 64
+    canonical_echo_count: int | None = None
     noise_standard_deviation: float = 0.005
     component_count_minimum: int = 1
     component_count_maximum: int = 5
@@ -37,6 +37,8 @@ class ContinuousNMRSpec:
     def __post_init__(self) -> None:
         if self.protocol_id != PROTOCOL_ID:
             raise ValueError("Unsupported continuous NMR protocol_id.")
+        if self.canonical_echo_count is None and isinstance(self.num_measurements, int):
+            object.__setattr__(self, "canonical_echo_count", max(64, self.num_measurements))
         integer_fields = (
             "num_measurements",
             "num_spectrum_bins",
@@ -49,10 +51,10 @@ class ContinuousNMRSpec:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer.")
-        if self.num_measurements not in (32, 64):
-            raise ValueError("Version 1 supports only the nested M=32 or M=64 schedule.")
-        if self.canonical_echo_count != 64:
-            raise ValueError("Version 1 fixes the canonical echo grid to 64 points.")
+        if self.num_measurements not in (32, 64, 128):
+            raise ValueError("Supported measurement schedules are M=32, M=64, and M=128.")
+        if self.canonical_echo_count != max(64, self.num_measurements):
+            raise ValueError("canonical_echo_count must equal max(64, num_measurements).")
         if self.num_spectrum_bins < 8 or self.num_spectrum_bins % 8:
             raise ValueError("num_spectrum_bins must be a positive multiple of eight.")
         if self.component_count_minimum != 1 or self.component_count_maximum != 5:

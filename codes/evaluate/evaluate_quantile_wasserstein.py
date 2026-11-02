@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, ExitStack
 import json
 import math
 import sys
@@ -24,6 +25,7 @@ if str(CODES_DIR) not in sys.path:
 from samplers.quantile_wasserstein_sampler import QuantileWassersteinSampler
 from utils.checkpoint_utils import validate_checkpoint_path
 from utils.nmr_utils import (
+    decode_quantiles,
     find_latest_checkpoint,
     histogram_to_quantiles,
     histogram_w1,
@@ -31,7 +33,7 @@ from utils.nmr_utils import (
     make_condition,
     make_normalized_log_rate_edges,
     quantile_wasserstein_representation_signature,
-    quantiles_to_histograms,
+    qwfm_decoder_signature,
     save_reconstruction_figure,
     save_reconstruction_grid_figure,
     write_json,
@@ -56,6 +58,12 @@ from utils.unet_config import (
     validate_unet_config,
 )
 from utils.training_utils import format_console_log_record
+from utils.proper_score_locks import file_lock
+from utils.quantile_decoder_artifacts import (
+    decoder_comparison_metadata,
+    quantile_tensor_sha256,
+    validate_saved_quantiles,
+)
 from evaluate.evaluate_saved_samples import EvaluationSettings
 
 
@@ -122,6 +130,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--kernel_bandwidth", type=float, default=None,
                         help="Fixed Gaussian bandwidth; default: independent simulator calibration median.")
     parser.add_argument("--reuse_existing", type=parse_bool, required=True)
+    parser.add_argument(
+        "--compare_decoders", type=parse_bool, default=False,
+        help="Evaluate hard_bin and linear_cdf on identical saved quantile states in separate directories.",
+    )
     parser.add_argument("--peak_relative_threshold", type=float, required=True)
     args = parser.parse_args(argv)
     _validate_args(args)
@@ -363,8 +375,9 @@ def _quantile_roundtrip_diagnostics(
     args: argparse.Namespace,
     dataset: PosteriorConditionDataset,
     primary_reference: dict[str, Any],
+    decoder: str = "hard_bin",
 ) -> dict[str, float]:
-    """Retain the original QWFM decoder diagnostics on the SMC reference set."""
+    """Evaluate the selected decoder on exact SMC-reference quantiles."""
 
     references = primary_reference["reference_histograms"].to(torch.float64)
     flat_references = references.reshape(-1, references.shape[-1])
@@ -393,9 +406,10 @@ def _quantile_roundtrip_diagnostics(
             normalized_edges,
             num_quantiles=args.num_quantiles,
         )
-        roundtrip = quantiles_to_histograms(
+        roundtrip = decode_quantiles(
             reference_quantiles,
             normalized_edges,
+            decoder=decoder,
         )
         nrmse = torch.linalg.vector_norm(roundtrip - reference_chunk, dim=-1) / (
             torch.linalg.vector_norm(reference_chunk, dim=-1).clamp_min(1.0e-12)
@@ -512,6 +526,13 @@ def _evaluate_ode_steps(
     oracle_reference: dict[str, Any],
     num_ode_steps: int,
 ) -> None:
+    if getattr(args, "compare_decoders", False):
+        _evaluate_decoder_comparison(
+            args, accelerator, model, loader, dataset, checkpoint,
+            checkpoint_state, training_config, primary_reference,
+            oracle_reference, num_ode_steps,
+        )
+        return
     spec = spec_from_args(args)
     nfe_directory = (
         Path(args.output_dir) / args.eval_output_subdir / f"nfe_{num_ode_steps:04d}"
@@ -771,6 +792,349 @@ def _evaluate_ode_steps(
     accelerator.wait_for_everyone()
 
 
+def _comparison_provenance(
+    provenance: dict[str, Any], decoder: str,
+) -> dict[str, Any]:
+    """Keep checkpoint identity unchanged and version only the output decoder."""
+    return {
+        **provenance,
+        "sampling_config": {
+            **provenance["sampling_config"],
+            "histogram_decoder": qwfm_decoder_signature(decoder),
+            "decoder_comparison": "paired_final_quantiles_v1",
+        },
+    }
+
+
+@contextmanager
+def _comparison_writer_lock(args: argparse.Namespace, accelerator: Accelerator):
+    """Protect the complete paired sweep, including cache decisions and metrics."""
+    if not getattr(args, "compare_decoders", False):
+        yield
+        return
+    lock_path = Path(args.output_dir) / args.eval_output_subdir / ".decoder_comparison.lock"
+    stack = ExitStack()
+    acquisition_error = None
+    if accelerator.is_main_process:
+        try:
+            stack.enter_context(file_lock(
+                lock_path,
+                message="Another process is writing this QWFM decoder comparison. "
+                        "Wait for it to finish before rerunning the same comparison output.",
+            ))
+        except Exception as error:
+            acquisition_error = error
+    try:
+        _collective_raise_if_failed(
+            accelerator, acquisition_error, "Decoder comparison writer lock",
+        )
+        yield
+    finally:
+        release_error = None
+        if accelerator.is_main_process:
+            try:
+                stack.close()
+            except Exception as error:
+                release_error = error
+        _collective_raise_if_failed(
+            accelerator, release_error, "Decoder comparison writer lock release",
+        )
+
+
+def _validated_comparison_quantiles(
+    artifact: dict[str, Any],
+    normalized_edges: torch.Tensor,
+    *,
+    decoder: str,
+    num_quantiles: int,
+) -> torch.Tensor:
+    quantiles = validate_saved_quantiles(artifact)
+    expected_shape = (*artifact["samples"].shape[:2], num_quantiles)
+    if not torch.is_tensor(quantiles) or tuple(quantiles.shape) != expected_shape:
+        raise ValueError(
+            "Decoder comparison requires saved final quantiles with shape "
+            f"{expected_shape}. Histograms alone cannot be redecoded. "
+            "Use a new comparison output directory to generate the paired samples."
+        )
+    quantiles = quantiles.detach().cpu()
+    if not quantiles.is_floating_point() or not bool(torch.isfinite(quantiles).all()):
+        raise ValueError("Saved quantiles must be finite floating-point positions.")
+    if bool(((quantiles < 0) | (quantiles > 1)).any()) or bool(
+        (quantiles[..., 1:] < quantiles[..., :-1]).any()
+    ):
+        raise ValueError("Saved final quantiles must lie in [0,1] and be ordered.")
+    digest = quantile_tensor_sha256(quantiles)
+    expected_metadata = {
+        "protocol_version": "qwfm_decoder_comparison_v1",
+        "decoder_name": decoder,
+        "decoder_signature": qwfm_decoder_signature(decoder),
+        "quantile_sha256": digest,
+    }
+    if artifact.get("quantile_sha256") != digest or artifact.get(
+        "decoder_comparison"
+    ) != expected_metadata:
+        raise ValueError("Cached decoder comparison has stale quantile/decoder provenance.")
+    decoded = decode_quantiles(
+        quantiles.reshape(-1, num_quantiles), normalized_edges, decoder=decoder,
+    ).reshape_as(artifact["samples"]).to(artifact["samples"].dtype)
+    if not torch.allclose(decoded, artifact["samples"].cpu(), rtol=0, atol=1e-7):
+        raise ValueError("Cached histograms do not match their saved quantiles and decoder.")
+    return quantiles
+
+
+def _build_comparison_artifact(
+    *,
+    quantiles: torch.Tensor,
+    decoder: str,
+    normalized_edges: torch.Tensor,
+    artifact_arguments: dict[str, Any],
+) -> dict[str, Any]:
+    quantiles = quantiles.detach().cpu().contiguous()
+    groups, count, length = quantiles.shape
+    histograms = decode_quantiles(
+        quantiles.reshape(-1, length), normalized_edges, decoder=decoder,
+    ).reshape(groups, count, -1)
+    arguments = dict(artifact_arguments)
+    sampling_config = arguments.pop("sampling_config", {})
+    artifact = build_sampling_artifact(
+        **arguments,
+        samples=histograms,
+        sampling_config={
+            **sampling_config,
+            "histogram_decoder": qwfm_decoder_signature(decoder),
+            "decoder_comparison": "paired_final_quantiles_v1",
+        },
+    )
+    artifact["quantiles"] = quantiles
+    artifact["decoder_comparison"] = decoder_comparison_metadata(quantiles, decoder)
+    artifact["quantile_sha256"] = artifact["decoder_comparison"]["quantile_sha256"]
+    return artifact
+
+
+def _evaluate_decoder_comparison(
+    args: argparse.Namespace,
+    accelerator: Accelerator,
+    model,
+    loader,
+    dataset: PosteriorConditionDataset,
+    checkpoint: Path,
+    checkpoint_state: dict[str, Any],
+    training_config: dict[str, Any],
+    primary_reference: dict[str, Any],
+    oracle_reference: dict[str, Any],
+    num_ode_steps: int,
+) -> None:
+    """One ODE trajectory supplies both decoders; existing artifacts are immutable."""
+    spec = spec_from_args(args)
+    root = Path(args.output_dir) / args.eval_output_subdir
+    directories = {
+        name: root / name / f"nfe_{num_ode_steps:04d}"
+        for name in ("hard_bin", "linear_cdf")
+    }
+    reuse_pair = args.reuse_existing and (directories["hard_bin"] / "samples.pt").is_file()
+    expected = _expected_artifact_provenance(
+        args, spec=spec, primary_reference=primary_reference,
+        training_config=training_config, checkpoint=checkpoint,
+        num_ode_steps=num_ode_steps,
+    )
+    normalized_edges = make_normalized_log_rate_edges(dataset.log_rate_edges).cpu()
+    artifacts: dict[str, dict[str, Any]] = {}
+    quantiles = None
+    diagnostic_totals: dict[str, float] = {}
+    elapsed = 0.0
+    cache_error = None
+    if accelerator.is_main_process:
+        try:
+            if reuse_pair:
+                for decoder, directory in directories.items():
+                    path = directory / "samples.pt"
+                    # A stopped run can be resumed from its hard-bin raw states.
+                    if decoder == "linear_cdf" and not path.exists():
+                        continue
+                    artifact = load_reusable_sampling_artifact(
+                        path,
+                        expected_provenance=_comparison_provenance(expected, decoder),
+                        primary_reference=primary_reference,
+                        oracle_reference=oracle_reference,
+                        sample_count=args.num_posterior_samples,
+                    )
+                    saved_quantiles = _validated_comparison_quantiles(
+                        artifact, normalized_edges, decoder=decoder,
+                        num_quantiles=args.num_quantiles,
+                    )
+                    if quantiles is not None and not torch.equal(quantiles, saved_quantiles):
+                        raise ValueError("Decoder comparison artifacts use different trajectories.")
+                    quantiles = saved_quantiles
+                    artifacts[decoder] = artifact
+                diagnostic_totals = artifacts["hard_bin"]["sampler_diagnostic_totals"]
+                elapsed = float(artifacts["hard_bin"]["sampling_wall_seconds"])
+            else:
+                occupied = [str(d / "samples.pt") for d in directories.values()
+                            if (d / "samples.pt").exists()]
+                if occupied:
+                    raise FileExistsError(
+                        "Comparison artifacts already exist and will not be overwritten. "
+                        "Use --reuse_existing=true or a new eval_output_subdir: "
+                        + ", ".join(occupied)
+                    )
+        except Exception as error:
+            cache_error = error
+    _collective_raise_if_failed(accelerator, cache_error, "Decoder comparison cache validation")
+
+    if not reuse_pair:
+        sampler = QuantileWassersteinSampler(
+            model, accelerator.device,
+            source_seed=args.source_seed + accelerator.process_index,
+            log_rate_edges=dataset.log_rate_edges,
+            model_time_scale=args.model_time_scale,
+        )
+        quantile_batches, id_batches, measurement_batches = [], [], []
+        accelerator.wait_for_everyone()
+        _synchronize_device(accelerator.device)
+        started = time.perf_counter()
+        for batch in loader:
+            condition = make_condition(
+                batch["measurement"], dataset.echo_times,
+                output_size=args.num_quantiles,
+                noise_standard_deviation=args.noise_standard_deviation,
+            )
+            _, diagnostics = sampler.sample(
+                condition,
+                num_samples_per_condition=args.num_posterior_samples,
+                num_ode_steps=num_ode_steps,
+                return_quantiles=True,
+            )
+            final_quantiles = diagnostics.pop("quantiles")
+            gathered = accelerator.gather_for_metrics(
+                (final_quantiles, batch["condition_id"], batch["measurement"])
+            )
+            if accelerator.is_main_process:
+                quantile_batches.append(gathered[0].detach().cpu())
+                id_batches.append(gathered[1].detach().cpu())
+                measurement_batches.append(gathered[2].detach().cpu())
+            for name, value in diagnostics.items():
+                reduced = accelerator.reduce(value, reduction="sum")
+                if accelerator.is_main_process:
+                    diagnostic_totals[name] = diagnostic_totals.get(name, 0.0) + float(reduced)
+        _synchronize_device(accelerator.device)
+        elapsed = float(accelerator.gather(torch.tensor(
+            [time.perf_counter() - started], device=accelerator.device,
+            dtype=torch.float64,
+        )).max())
+        gather_error = None
+        if accelerator.is_main_process:
+            try:
+                if not quantile_batches:
+                    raise RuntimeError("Evaluation loader produced no batches.")
+                condition_ids = torch.cat(id_batches)
+                order = condition_ids.argsort()
+                if not torch.equal(condition_ids[order], primary_reference["condition_ids"].cpu()):
+                    raise ValueError("Gathered conditions differ from the reference conditions.")
+                if not torch.allclose(torch.cat(measurement_batches)[order],
+                                      primary_reference["measurements"].cpu(), rtol=0, atol=1e-7):
+                    raise ValueError("Gathered measurements differ from the reference.")
+                quantiles = torch.cat(quantile_batches)[order]
+            except Exception as error:
+                gather_error = error
+        _collective_raise_if_failed(accelerator, gather_error, "Decoder comparison gather")
+
+    postprocess_error = None
+    if accelerator.is_main_process:
+        try:
+            assert quantiles is not None
+            settings = EvaluationSettings(
+                sample_count=args.num_posterior_samples,
+                reference_repeats=args.reference_repeats, nearest_k=args.nearest_k,
+                w2_num_quantiles=args.w2_num_quantiles,
+                distance_chunk_size=args.distance_chunk_size, seed=args.metric_seed,
+                credible_interval_level=args.credible_interval_level,
+                kernel_bandwidth=getattr(args, "kernel_bandwidth", None),
+            )
+            for decoder, directory in directories.items():
+                if decoder not in artifacts:
+                    artifact = _build_comparison_artifact(
+                        quantiles=quantiles, decoder=decoder,
+                        normalized_edges=normalized_edges,
+                        artifact_arguments={
+                            "spec": spec, "primary_reference": primary_reference,
+                            "method": EXPERIMENT_NAME, "training_config": training_config,
+                            "output_dir": args.output_dir, "checkpoint": checkpoint,
+                            "model_subfolder": args.model_subfolder,
+                            "primary_reference_path": args.primary_reference,
+                            "state_size": args.num_quantiles, "deterministic": False,
+                            "sampling_config": expected["sampling_config"],
+                            "source_seed": args.source_seed, "sampling_wall_seconds": elapsed,
+                            "inference_settings": expected["inference_settings"],
+                            "sampler_diagnostic_totals": diagnostic_totals,
+                        },
+                    )
+                    artifacts[decoder] = save_or_reuse_sampling_artifact(
+                        directory / "samples.pt", artifact, reuse_existing=False,
+                        primary_reference=primary_reference, oracle_reference=oracle_reference,
+                        sample_count=args.num_posterior_samples,
+                    )
+                artifact = artifacts[decoder]
+                evaluate_and_write_metrics(
+                    artifact, primary_reference, oracle_reference, directory,
+                    settings=settings, device=accelerator.device,
+                )
+                diagnostics = _quantile_roundtrip_diagnostics(
+                    args, dataset, primary_reference, decoder=decoder,
+                )
+                for output_name, numerator, denominator in (
+                    ("pre_isotonic_projection_crossing_fraction", "pre_isotonic_projection_crossing_count",
+                     "pre_isotonic_projection_inspected_pair_count"),
+                    ("pre_clipping_out_of_domain_fraction", "pre_clipping_out_of_domain_count",
+                     "pre_clipping_inspected_value_count"),
+                ):
+                    diagnostics[output_name] = _safe_ratio(
+                        diagnostic_totals[numerator], diagnostic_totals[denominator], output_name,
+                    )
+                write_json(directory / "sampling_summary.json", {
+                    "experiment": EXPERIMENT_NAME,
+                    "checkpoint_iteration": _checkpoint_global_iteration(checkpoint_state),
+                    "ode_steps": int(num_ode_steps),
+                    "num_conditions": int(quantiles.shape[0]),
+                    "num_posterior_samples": int(quantiles.shape[1]),
+                    "sampling_wall_seconds": elapsed,
+                    "sampler_diagnostic_totals": diagnostic_totals,
+                    "quantile_diagnostics": diagnostics,
+                    "decoder_comparison": artifact["decoder_comparison"],
+                    "quantile_sha256": artifact["quantile_sha256"],
+                    **{field: artifact[field] for field in (
+                        "checkpoint", "model_subfolder", "source_seed", "reference_path",
+                    )},
+                    "condition_ids": artifact["condition_ids"].tolist(),
+                })
+                save_reconstruction_figure(
+                    directory / "ground_truth_vs_reconstruction.png",
+                    artifact["samples"][0, :args.num_visual_samples],
+                    primary_reference["truth_histograms"][0],
+                    primary_reference["measurements"][0], dataset.rate_centers,
+                    dataset.echo_times, dataset.kernel,
+                    noise_standard_deviation=args.noise_standard_deviation,
+                    figure_title=f"QWFM | {decoder} decoder | Euler NFE {num_ode_steps}",
+                )
+                if quantiles.shape[0] >= 16:
+                    save_reconstruction_grid_figure(
+                        directory / "ground_truth_vs_reconstruction_grid.png",
+                        artifact["samples"][:16], primary_reference["truth_histograms"][:16],
+                        dataset.rate_centers,
+                    )
+                print(format_console_log_record({
+                    "decoder": decoder, "nfe": int(num_ode_steps),
+                    "num_conditions": int(quantiles.shape[0]),
+                    "num_posterior_samples": int(quantiles.shape[1]),
+                    "sampling_wall_seconds": elapsed,
+                }, indent=2, sort_keys=True), flush=True)
+        except Exception as error:
+            postprocess_error = error
+    _collective_raise_if_failed(
+        accelerator, postprocess_error, f"NFE={num_ode_steps} paired decoder postprocessing",
+    )
+    accelerator.wait_for_everyone()
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     accelerator = Accelerator(mixed_precision=args.mixed_precision)
@@ -811,33 +1175,45 @@ def main(argv: list[str] | None = None) -> None:
         shuffle=False,
         num_workers=args.dataloader_num_workers,
     )
-    model = UNet1DModel.from_pretrained(
-        checkpoint / args.model_subfolder,
-    )
-    validate_unet_config(
-        model,
-        sample_size=args.num_quantiles,
-        num_measurements=args.num_measurements,
-    )
-    model, loader = accelerator.prepare(model, loader)
-    if len(loader) == 0:
-        raise ValueError("The prepared evaluation loader has no batches.")
-    model.eval()
-
-    for num_ode_steps in args.eval_ode_steps:
-        _evaluate_ode_steps(
-            args,
-            accelerator,
-            model,
-            loader,
-            dataset,
-            checkpoint,
-            checkpoint_state,
-            root_config,
-            primary_reference,
-            oracle_reference,
-            num_ode_steps,
+    with _comparison_writer_lock(args, accelerator):
+        comparison_fully_cached = (
+            args.compare_decoders and args.reuse_existing
+            and all((Path(args.output_dir) / args.eval_output_subdir / "hard_bin"
+                     / f"nfe_{nfe:04d}" / "samples.pt").is_file()
+                    for nfe in args.eval_ode_steps)
         )
+        if comparison_fully_cached:
+            # Re-decoding / metric refresh from saved states never loads the network.
+            model = None
+            loader = accelerator.prepare(loader)
+        else:
+            model = UNet1DModel.from_pretrained(
+                checkpoint / args.model_subfolder,
+            )
+            validate_unet_config(
+                model,
+                sample_size=args.num_quantiles,
+                num_measurements=args.num_measurements,
+            )
+            model, loader = accelerator.prepare(model, loader)
+            model.eval()
+        if len(loader) == 0:
+            raise ValueError("The prepared evaluation loader has no batches.")
+
+        for num_ode_steps in args.eval_ode_steps:
+            _evaluate_ode_steps(
+                args,
+                accelerator,
+                model,
+                loader,
+                dataset,
+                checkpoint,
+                checkpoint_state,
+                root_config,
+                primary_reference,
+                oracle_reference,
+                num_ode_steps,
+            )
     accelerator.end_training()
 
 

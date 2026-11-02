@@ -35,15 +35,6 @@ from codes.utils.io_utils import atomic_write_json, load_torch_artifact
 
 
 VISUALIZATION_PROTOCOL_VERSION = "continuous_posterior_kshot_gallery_v2"
-_GRID_FIELDS = (
-    "log_rate_edges",
-    "rate_edges",
-    "rate_centers",
-    "echo_times_64",
-    "echo_subset_indices",
-    "echo_times",
-    "kernel",
-)
 
 
 def _same_tensor(first: torch.Tensor, second: torch.Tensor, *, atol: float) -> bool:
@@ -97,10 +88,13 @@ def validate_visualization_artifacts(
     if reference.get("specification_hash") != spec.specification_hash:
         raise ValueError("reference specification hash is inconsistent.")
     expected_grid = build_nmr_grid(spec).as_artifact()
+    grid_fields = tuple(
+        field for field, value in expected_grid.items() if isinstance(value, torch.Tensor)
+    )
     reference_grid = reference.get("grid")
     if not isinstance(reference_grid, dict):
         raise ValueError("reference artifact is missing its grid.")
-    for field in _GRID_FIELDS:
+    for field in grid_fields:
         if field not in reference_grid or not isinstance(
             reference_grid[field], torch.Tensor
         ):
@@ -182,7 +176,7 @@ def validate_visualization_artifacts(
             raise ValueError(f"model {label!r} is missing its grid.")
         if model_grid.get("specification_hash") != spec.specification_hash:
             raise ValueError(f"model {label!r} grid hash differs.")
-        for field in _GRID_FIELDS:
+        for field in grid_fields:
             if field not in model_grid or not isinstance(
                 model_grid[field], torch.Tensor
             ):

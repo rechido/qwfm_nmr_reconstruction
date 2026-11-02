@@ -76,6 +76,7 @@ class QuantileWassersteinSampler:
         condition: torch.Tensor,
         num_samples_per_condition: int,
         num_ode_steps: int,
+        return_quantiles: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         batch_size, _, num_quantiles = condition.shape
         num_bins = int(self.normalized_log_rate_edges.numel() - 1)
@@ -144,9 +145,16 @@ class QuantileWassersteinSampler:
             self.normalized_log_rate_edges,
         )
         samples = decoded.reshape(batch_size, num_samples_per_condition, num_bins)
-        return samples, {
+        extras = {
             "pre_isotonic_projection_crossing_count": crossing_count,
             "pre_isotonic_projection_inspected_pair_count": inspected_pair_count,
             "pre_clipping_out_of_domain_count": out_of_domain_count,
             "pre_clipping_inspected_value_count": inspected_value_count,
         }
+        if return_quantiles:
+            # Store the final projected state before any histogram decoding.
+            # Re-decoding it must not alter the flow path or source RNG stream.
+            extras["quantiles"] = state.reshape(
+                batch_size, num_samples_per_condition, num_quantiles
+            ).detach()
+        return samples, extras

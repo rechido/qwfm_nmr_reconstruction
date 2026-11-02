@@ -7,6 +7,8 @@ from pathlib import Path
 import re
 from typing import Any
 
+from codes.data.spec import ContinuousNMRSpec
+
 
 VARIANTS = {
     "histogram_linear": ("histogram_linear", "histogram_linear_{shape}_unet64x4_t1024", None, None),
@@ -22,6 +24,16 @@ VARIANTS = {
 
 
 FLOW_METHODS = {"histogram_linear", "quantile_wasserstein"}
+
+
+def experiment_dimensions(experiment_dir: Path) -> tuple[int, int]:
+    """Read and validate the simulator dimensions encoded by ``m<M>n<N>``."""
+    match = re.fullmatch(r"m([1-9]\d*)n([1-9]\d*)", experiment_dir.name)
+    if match is None:
+        raise ValueError("Experiment directory names must have the form m<M>n<N>.")
+    measurements, bins = map(int, match.groups())
+    ContinuousNMRSpec(num_measurements=measurements, num_spectrum_bins=bins)
+    return measurements, bins
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -45,10 +57,8 @@ def resolve_training_dir(
 ) -> Path:
     experiment_dir = experiment_dir.expanduser().resolve()
     if training_dir is None:
-        match = re.fullmatch(r"m(32|64)n128", experiment_dir.name)
-        if match is None:
-            raise ValueError("Automatic model names support m32n128/m64n128; supply --training_dir for a custom experiment.")
-        shape = f"m{match.group(1)}_n128"
+        measurements, bins = experiment_dimensions(experiment_dir)
+        shape = f"m{measurements}_n{bins}"
         result = experiment_dir / VARIANTS[variant][1].format(shape=shape)
     else:
         result = training_dir.expanduser().resolve()

@@ -49,15 +49,6 @@ from codes.utils.io_utils import atomic_write_json, load_torch_artifact
 AUDIT_PROTOCOL_VERSION = "independent_smc_reference_audit_v3"
 RAW_FILENAME = "reference_audit_raw.json"
 SUMMARY_FILENAME = "reference_audit_summary.json"
-_GRID_TENSOR_FIELDS = (
-    "log_rate_edges",
-    "rate_edges",
-    "rate_centers",
-    "echo_times_64",
-    "echo_subset_indices",
-    "echo_times",
-    "kernel",
-)
 
 
 @dataclass(frozen=True)
@@ -196,9 +187,10 @@ def _validate_grid(
 ) -> None:
     if grid.get("specification_hash") != expected_grid["specification_hash"]:
         raise ValueError(f"{artifact_name}.grid specification hash differs.")
-    for field in _GRID_TENSOR_FIELDS:
+    for field, expected in expected_grid.items():
+        if not isinstance(expected, torch.Tensor):
+            continue
         value = _required(grid, field, f"{artifact_name}.grid")
-        expected = expected_grid[field]
         if not isinstance(value, torch.Tensor):
             raise ValueError(f"{artifact_name}.grid[{field!r}] must be a tensor.")
         tolerance = 1.0e-12 if expected.is_floating_point() else 0.0

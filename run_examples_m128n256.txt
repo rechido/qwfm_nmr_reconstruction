@@ -1,0 +1,79 @@
+# Experiment pipelines: m128n256
+# Run from the repository root in an activated Python/CUDA environment.
+# Copy each command as written; the shell scripts take no arguments.
+# All values, including GPU IDs and process count, are set inside each script.
+# The defaults preserve the paper protocol: four GPUs for training/test sampling, one for PR/SMC.
+# Run the shared preparation once, then complete any one model's block.
+# Its visualization needs no other model and no other M/N setting.
+# Follow this list's order; script prefixes identify operations, not execution order.
+# Finish each command successfully before continuing; stop if the SMC audit fails.
+# Sampling requires the final 200,000-update EMA. Keep that checkpoint fixed during evaluation.
+# ES/KS, forward evaluation, and final visualization reuse saved artifacts.
+
+# 0. Shared preparation for all four models (once per setting).
+# Independent test pairs for ES/KS, forward consistency, and reconstruction previews.
+bash scripts/paper/m128n256/00_prepare_test_conditions.sh
+# Three SMC banks and their audit, required only for PR evaluation.
+bash scripts/paper/m128n256/10_build_reference_run0.sh
+bash scripts/paper/m128n256/11_build_reference_run1.sh
+bash scripts/paper/m128n256/12_build_reference_run2.sh
+bash scripts/paper/m128n256/13_audit_references.sh
+
+# 1. HFM: complete this model's pipeline, including its own visualization.
+# Train to 200,000 updates.
+bash scripts/paper/m128n256/01_train_histogram_linear.sh
+# Generate and save independent-test predictions.
+bash scripts/paper/m128n256/30_generate_histogram_linear_samples.sh
+# Evaluate L2/exact-W2 ES/KS, then individual/mean-spectrum forward errors (CPU).
+bash scripts/paper/m128n256/40_evaluate_histogram_linear_scores.sh
+bash scripts/paper/m128n256/50_evaluate_histogram_linear_forward.sh
+# PR branch: generate samples for the SMC conditions and evaluate.
+bash scripts/paper/m128n256/20_evaluate_pr_histogram_linear.sh
+# Level 1: this model's metric/NFE plots, CSV summaries, and reconstruction previews.
+bash scripts/paper/m128n256/60_visualize_histogram_linear.sh
+
+# 2. QWFM (linear-CDF decoding): complete this model's pipeline, including its own visualization.
+# Train to 200,000 updates.
+bash scripts/paper/m128n256/02_train_quantile_wasserstein.sh
+# Generate and save independent-test predictions.
+bash scripts/paper/m128n256/31_generate_quantile_wasserstein_samples.sh
+# Evaluate L2/exact-W2 ES/KS, then individual/mean-spectrum forward errors (CPU).
+bash scripts/paper/m128n256/41_evaluate_quantile_wasserstein_scores.sh
+bash scripts/paper/m128n256/51_evaluate_quantile_wasserstein_forward.sh
+# PR branch: generate samples for the SMC conditions and evaluate.
+bash scripts/paper/m128n256/21_evaluate_pr_quantile_wasserstein.sh
+# Level 1: this model's metric/NFE plots, CSV summaries, and reconstruction previews.
+bash scripts/paper/m128n256/61_visualize_quantile_wasserstein.sh
+
+# 3. Regression (MSE + W1): complete this model's pipeline, including its own visualization.
+# Train to 200,000 updates.
+bash scripts/paper/m128n256/03_train_regression.sh
+# Generate and save independent-test predictions.
+bash scripts/paper/m128n256/32_generate_regression_samples.sh
+# Evaluate L2/exact-W2 ES/KS, then individual/mean-spectrum forward errors (CPU).
+bash scripts/paper/m128n256/42_evaluate_regression_scores.sh
+bash scripts/paper/m128n256/52_evaluate_regression_forward.sh
+# PR branch: generate samples for the SMC conditions and evaluate.
+bash scripts/paper/m128n256/22_evaluate_pr_regression.sh
+# Level 1: this model's metric/NFE plots, CSV summaries, and reconstruction previews.
+bash scripts/paper/m128n256/62_visualize_regression.sh
+
+# 4. CVAE (z=16): complete this model's pipeline, including its own visualization.
+# Train to 200,000 updates.
+bash scripts/paper/m128n256/04_train_conditional_vae.sh
+# Generate and save independent-test predictions.
+bash scripts/paper/m128n256/33_generate_conditional_vae_samples.sh
+# Evaluate L2/exact-W2 ES/KS, then individual/mean-spectrum forward errors (CPU).
+bash scripts/paper/m128n256/43_evaluate_conditional_vae_scores.sh
+bash scripts/paper/m128n256/53_evaluate_conditional_vae_forward.sh
+# PR branch: generate samples for the SMC conditions and evaluate.
+bash scripts/paper/m128n256/23_evaluate_pr_conditional_vae.sh
+# Level 1: this model's metric/NFE plots, CSV summaries, and reconstruction previews.
+bash scripts/paper/m128n256/63_visualize_conditional_vae.sh
+
+# 5. Level 2: compare the four completed models in this setting.
+# Read their saved metrics and reconstructions; no other setting is required.
+bash scripts/paper/m128n256/70_compare_models.sh
+
+# Level 3 is optional after all three settings finish: run_examples_comparisons.txt.
+# Levels 1 and 2 are complete independently; they do not depend on Level 3.

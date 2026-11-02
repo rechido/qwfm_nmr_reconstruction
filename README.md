@@ -177,6 +177,6 @@ Da Eun Lee and Byung-Woo Hong, Chung-Ang University. **Manuscript under review.*
 
 For questions and bug reports, use [GitHub Issues](https://github.com/rechido/qwfm_nmr_reconstruction/issues).
 
-## License
+## Acknowledgments
 
-A license has not yet been specified for this repository.
+This codebase uses [Hugging Face Diffusers](https://github.com/huggingface/diffusers). OpenAI Codex, including GPT-5 Sol Ultra and GPT-6 Astra Ultra, was used to assist with code modifications.

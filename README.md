@@ -12,49 +12,49 @@ QWFM represents a spectrum by **quantile positions on the log-rate axis**. Inter
 
 ### 1. Encode histograms as quantiles
 
-For bin masses $h_n$ on normalized log-rate bins $[b_{n-1},b_n)$, $b_n=n/N$, assume uniform density within each bin. At midpoint mass levels $u_\ell$, invert the piecewise-linear CDF:
+For bin masses $`h_n`$ on normalized log-rate bins $`[b_{n-1},b_n)`$, $`b_n=n/N`$, assume uniform density within each bin. At midpoint mass levels $`u_\ell`$, invert the piecewise-linear CDF:
 
-$$
+```math
 \begin{aligned}
 C_n&=\sum_{j=1}^{n}h_j,\quad C_0=0,\qquad u_\ell=\frac{\ell+1/2}{L},\\
 q_\ell&=b_{n-1}+\frac{u_\ell-C_{n-1}}{h_n}(b_n-b_{n-1}),
-\qquad C_{n-1}\le u_\ell<C_n.
+\qquad C_{n-1}\le u_\ell\lt C_n.
 \end{aligned}
-$$
+```
 
-Here $\ell=0,\ldots,L-1$; each $q_\ell$ is a spectral position at a fixed cumulative mass level.
+Here $`\ell=0,\ldots,L-1`$; each $`q_\ell`$ is a spectral position at a fixed cumulative mass level.
 
 ### 2. Learn a conditional quantile flow
 
 On this normalized axis, one-dimensional Wasserstein geometry gives
-$W_2^2=\int_0^1|Q_1(u)-Q_0(u)|^2\,du\approx L^{-1}\|\mathbf q_1-\mathbf q_0\|_2^2$.
-Linear interpolation of the full quantile functions is a $W_2$ geodesic. A conditional 1D U-Net learns its finite-coordinate velocity:
+$`W_2^2=\int_0^1|Q_1(u)-Q_0(u)|^2\,du\approx L^{-1}\|\mathbf q_1-\mathbf q_0\|_2^2`$.
+Linear interpolation of the full quantile functions is a $`W_2`$ geodesic. A conditional 1D U-Net learns its finite-coordinate velocity:
 
-$$
+```math
 \begin{aligned}
 \mathbf q_t&=(1-t)\mathbf q_0+t\mathbf q_1,\qquad t\sim\mathcal U(0,1),\\
 \mathcal L_{\mathrm{QWFM}}&=
 \mathbb E\!\left[\frac{1}{L}
 \left\|v_\theta(\mathbf q_t,t,\mathbf c)-(\mathbf q_1-\mathbf q_0)\right\|_2^2\right].
 \end{aligned}
-$$
+```
 
-The condition $\mathbf c$ contains the observed decay, echo times, and noise level. Sampling uses Euler steps with clipping and isotonic projection to keep quantiles bounded and ordered.
+The condition $`\mathbf c`$ contains the observed decay, echo times, and noise level. Sampling uses Euler steps with clipping and isotonic projection to keep quantiles bounded and ordered.
 
 ### 3. Decode quantiles into bin masses
 
 The **linear-CDF decoder** interpolates generated quantiles and recovers cumulative mass at bin boundaries:
 
-$$
+```math
 \begin{aligned}
 \widehat Q(u)&=(1-\alpha)\widehat q_\ell+\alpha\widehat q_{\ell+1},
 \qquad \alpha=\frac{u-u_\ell}{u_{\ell+1}-u_\ell},\quad u_\ell\le u\le u_{\ell+1},\\
-\widehat F_n&=\int_0^1\mathbf 1\{\widehat Q(u)<b_n\}\,du,\qquad 1\le n<N,\\
+\widehat F_n&=\int_0^1\mathbf 1\{\widehat Q(u)\lt b_n\}\,du,\qquad 1\le n\lt N,\\
 \widehat h_n&=\widehat F_n-\widehat F_{n-1},\qquad n=1,\ldots,N.
 \end{aligned}
-$$
+```
 
-Endpoint quantiles use half-step extrapolation clipped to $[0,1]$, with $\widehat F_0=0$ and $\widehat F_N=1$. Repeating the flow from new sources yields multiple candidate spectra. See the [representation utilities](codes/utils/nmr_utils.py), [training objective](codes/trainers/quantile_wasserstein_trainer.py), and [sampler](codes/samplers/quantile_wasserstein_sampler.py).
+Endpoint quantiles use half-step extrapolation clipped to $`[0,1]`$, with $`\widehat F_0=0`$ and $`\widehat F_N=1`$. Repeating the flow from new sources yields multiple candidate spectra. See the [representation utilities](codes/utils/nmr_utils.py), [training objective](codes/trainers/quantile_wasserstein_trainer.py), and [sampler](codes/samplers/quantile_wasserstein_sampler.py).
 
 ## Installation
 

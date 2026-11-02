@@ -1,0 +1,132 @@
+# NMR 복원 실험: 측정점 64개, 스펙트럼 128구간
+# 이 파일이 있는 프로그램 최상위 폴더에서 필요한 명령을 하나씩 실행합니다.
+# 원하는 모델의 학습·평가 명령을 선택합니다. 전체 모델 비교 시에는 모든 모델을 실행합니다.
+# A: SMC 참조분포 비교는 1 → 2 → 3A → 4A → 5 순서입니다.
+# B: 합성 정답 기반 ES/KS 평가는 1 → 2 → 3B → 4B 순서이며, 그림도 자동 생성됩니다.
+# 두 평가를 모두 수행할 수 있습니다. 기존 수치해법만 평가할 때는 2번 학습을 생략합니다.
+
+# 1. 실행 환경 준비
+# Linux/Bash에서 CUDA 호환 PyTorch가 설치된 Python 환경을 활성화합니다.
+# 학습 및 학습 모델의 표본 생성은 GPU 4개 설정입니다. 실행 스크립트의 GPU_IDS를 확인합니다.
+python -m pip install -r requirements.txt
+
+# 2. 모델 학습
+# 학습 데이터는 실행 중 자동 생성됩니다. 별도 데이터 다운로드나 평가 데이터 준비는 필요 없습니다.
+# 모델별 학습이 완료된 뒤 해당 모델을 평가합니다. 동일 설정의 학습을 마쳤으면 이 단계를 생략합니다.
+# HFM
+bash scripts/m64n128/01_train_histogram_linear.sh
+# QWFM (L=128)
+bash scripts/m64n128/02_train_quantile_wasserstein_l128.sh
+# QWFM (L=256)
+bash scripts/m64n128/03_train_quantile_wasserstein_l256.sh
+# QWFM (L=512)
+bash scripts/m64n128/04_train_quantile_wasserstein_l512.sh
+# 회귀 (MSE)
+bash scripts/m64n128/05_train_deterministic_regression.sh
+# 조건부 정규화 흐름
+bash scripts/m64n128/07_train_conditional_normalizing_flow.sh
+# 조건부 VAE (z=16)
+bash scripts/m64n128/08_train_conditional_vae_z16.sh
+# 회귀 (MSE+W1)
+bash scripts/m64n128/09_train_deterministic_regression_mse_w1.sh
+# 조건부 VAE (z=32)
+bash scripts/m64n128/10_train_conditional_vae_z32.sh
+
+# 3A. SMC 비교용 평가 데이터와 참조분포 준비
+# 세 참조분포 생성을 모두 마친 뒤 00d를 실행합니다. 검사에 실패하면 4A로 진행하지 않습니다.
+bash scripts/m64n128/00a_build_posterior_reference_run0.sh
+bash scripts/m64n128/00b_build_posterior_reference_run1.sh
+bash scripts/m64n128/00c_build_posterior_reference_run2.sh
+bash scripts/m64n128/00d_audit_posterior_references.sh
+
+# 3B. ES/KS 평가용 합성 관측·정답 데이터 준비
+# 선택한 실험에서 한 번 실행합니다. SMC 참조분포나 학습된 모델은 필요 없습니다.
+bash scripts/m64n128/proper_scores/00_prepare_test_conditions.sh
+
+# 4A. SMC 참조분포를 이용한 복원·평가
+# 3A 완료 후 실행합니다. 학습 모델은 해당 체크포인트가 필요하며, 기존 수치해법은 학습이 필요 없습니다.
+bash scripts/m64n128/01_evaluate_histogram_linear.sh
+bash scripts/m64n128/02_evaluate_quantile_wasserstein_l128.sh
+bash scripts/m64n128/03_evaluate_quantile_wasserstein_l256.sh
+bash scripts/m64n128/04_evaluate_quantile_wasserstein_l512.sh
+bash scripts/m64n128/05_evaluate_deterministic_regression.sh
+bash scripts/m64n128/06a_evaluate_classical_nnls.sh
+bash scripts/m64n128/06b_evaluate_classical_x2_d2.sh
+bash scripts/m64n128/06c_evaluate_classical_discrepancy_d2.sh
+bash scripts/m64n128/06d_evaluate_classical_bayesreg_i_official.sh
+bash scripts/m64n128/06e_evaluate_classical_bayesreg_i_known_noise.sh
+bash scripts/m64n128/07_evaluate_conditional_normalizing_flow.sh
+bash scripts/m64n128/08_evaluate_conditional_vae_z16.sh
+bash scripts/m64n128/09_evaluate_deterministic_regression_mse_w1.sh
+bash scripts/m64n128/10_evaluate_conditional_vae_z32.sh
+
+# 4B. ES/KS 평가: 모델별 복원 표본 생성 후 점수 계산
+# 3B 완료 후 원하는 모델의 01 → 02를 순서대로 실행합니다.
+# 학습 모델의 01은 해당 체크포인트가 필요합니다. 기존 수치해법의 01과 모든 02는 CPU에서 실행합니다.
+# 각 02는 완료된 모델의 비교표와 ES/KS 비교 그림을 함께 갱신합니다.
+# 표본: outputs/m64n128/proper_scores/g16384_k8/
+# 평가 수치·그림: outputs/m64n128/metric_comparisons/proper_scores/g16384_k8/
+
+# HFM
+bash scripts/m64n128/proper_scores/histogram_linear/01_generate_samples.sh
+bash scripts/m64n128/proper_scores/histogram_linear/02_evaluate_scores.sh
+
+# QWFM (L=128)
+bash scripts/m64n128/proper_scores/quantile_wasserstein_l128/01_generate_samples.sh
+bash scripts/m64n128/proper_scores/quantile_wasserstein_l128/02_evaluate_scores.sh
+
+# QWFM (L=256)
+bash scripts/m64n128/proper_scores/quantile_wasserstein_l256/01_generate_samples.sh
+bash scripts/m64n128/proper_scores/quantile_wasserstein_l256/02_evaluate_scores.sh
+
+# QWFM (L=512)
+bash scripts/m64n128/proper_scores/quantile_wasserstein_l512/01_generate_samples.sh
+bash scripts/m64n128/proper_scores/quantile_wasserstein_l512/02_evaluate_scores.sh
+
+# 회귀 (MSE)
+bash scripts/m64n128/proper_scores/deterministic_regression/01_generate_samples.sh
+bash scripts/m64n128/proper_scores/deterministic_regression/02_evaluate_scores.sh
+
+# 조건부 정규화 흐름
+bash scripts/m64n128/proper_scores/conditional_normalizing_flow/01_generate_samples.sh
+bash scripts/m64n128/proper_scores/conditional_normalizing_flow/02_evaluate_scores.sh
+
+# 조건부 VAE (z=16)
+bash scripts/m64n128/proper_scores/conditional_vae_z16/01_generate_samples.sh
+bash scripts/m64n128/proper_scores/conditional_vae_z16/02_evaluate_scores.sh
+
+# 회귀 (MSE+W1)
+bash scripts/m64n128/proper_scores/deterministic_regression_mse_w1/01_generate_samples.sh
+bash scripts/m64n128/proper_scores/deterministic_regression_mse_w1/02_evaluate_scores.sh
+
+# 조건부 VAE (z=32)
+bash scripts/m64n128/proper_scores/conditional_vae_z32/01_generate_samples.sh
+bash scripts/m64n128/proper_scores/conditional_vae_z32/02_evaluate_scores.sh
+
+# NNLS
+bash scripts/m64n128/proper_scores/classic_nnls/01_generate_samples.sh
+bash scripts/m64n128/proper_scores/classic_nnls/02_evaluate_scores.sh
+
+# X2-D2
+bash scripts/m64n128/proper_scores/classic_x2_d2/01_generate_samples.sh
+bash scripts/m64n128/proper_scores/classic_x2_d2/02_evaluate_scores.sh
+
+# Discrepancy-D2
+bash scripts/m64n128/proper_scores/classic_discrepancy_d2/01_generate_samples.sh
+bash scripts/m64n128/proper_scores/classic_discrepancy_d2/02_evaluate_scores.sh
+
+# BayesReg-I (official)
+bash scripts/m64n128/proper_scores/classic_bayesreg_i_official/01_generate_samples.sh
+bash scripts/m64n128/proper_scores/classic_bayesreg_i_official/02_evaluate_scores.sh
+
+# BayesReg-I (known noise)
+bash scripts/m64n128/proper_scores/classic_bayesreg_i_known_noise/01_generate_samples.sh
+bash scripts/m64n128/proper_scores/classic_bayesreg_i_known_noise/02_evaluate_scores.sh
+
+# 5. SMC 비교 결과 시각화
+# 4A에서 원하는 모델의 평가를 마친 뒤 실행합니다.
+# 전체 모델의 평가 지표, 적분 단계 수별 지표, 관측별 복원 스펙트럼을 각각 그립니다.
+bash scripts/m64n128/90_plot_metrics_all_methods.sh
+bash scripts/m64n128/93_plot_metrics_fm_nfe_sweep.sh
+bash scripts/m64n128/94_visualize_all_methods.sh
+# 결과: outputs/m64n128/metric_comparisons/ 및 outputs/m64n128/qualitative/

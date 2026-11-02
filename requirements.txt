@@ -1,0 +1,8 @@
+# Install a CUDA-compatible PyTorch build for the target machine first.
+torch>=2.4,<3
+accelerate>=1.0,<2
+diffusers==0.35.2
+safetensors>=0.4,<1
+numpy>=1.26,<3
+scipy>=1.12,<2
+matplotlib>=3.9,<4

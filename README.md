@@ -39,9 +39,34 @@ Linear interpolation of the full quantile functions is a $`W_2`$ geodesic. A con
 \end{aligned}
 ```
 
-The condition $`\mathbf c`$ contains the observed decay, echo times, and noise level. Sampling uses Euler steps with clipping and isotonic projection to keep quantiles bounded and ordered.
+The condition $`\mathbf c`$ contains the observed decay, echo times, and noise level.
 
-### 3. Decode quantiles into bin masses
+### 3. Generate conditional samples
+
+At test time, fix $`\mathbf c`$, draw a new source histogram $`\widehat{\mathbf h}_0\sim\mathrm{Dirichlet}(\mathbf 1_N)`$, and encode it as $`\widehat{\mathbf q}_0`$ using step 1. The learned velocity defines the sampling ODE and its integral form:
+
+```math
+\begin{aligned}
+\frac{\mathrm d\widehat{\mathbf q}_t}{\mathrm dt}
+&=v_\theta(\widehat{\mathbf q}_t,t,\mathbf c),\qquad t\in[0,1],\\
+\widehat{\mathbf q}_1
+&=\widehat{\mathbf q}_0+\int_0^1v_\theta(\widehat{\mathbf q}_t,t,\mathbf c)\,\mathrm dt.
+\end{aligned}
+```
+
+In practice, start from $`\mathbf q^{(0)}=\widehat{\mathbf q}_0`$ and take $`K=\mathrm{NFE}`$ explicit Euler steps, with $`\Delta t=1/K`$ and $`t_k=k\Delta t`$. Each step clips positions before applying isotonic projection:
+
+```math
+\mathbf q^{(k+1)}=
+\Pi_{\uparrow}\!\left(
+\mathrm{clip}_{[0,1]}\!\left[
+\mathbf q^{(k)}+\Delta t\,v_\theta(\mathbf q^{(k)},t_k,\mathbf c)
+\right]\right),\qquad k=0,\ldots,K-1.
+```
+
+Here $`\Pi_{\uparrow}`$ is the equal-weight L2 isotonic projection onto nondecreasing vectors. Decode the final positions $`\widehat q_\ell=[\mathbf q^{(K)}]_\ell`$ below. Independent source draws give multiple reconstructions for the same fixed condition, without requiring a target spectrum.
+
+### 4. Decode quantiles into bin masses
 
 The **linear-CDF decoder** interpolates generated quantiles and recovers cumulative mass at bin boundaries:
 
@@ -54,7 +79,7 @@ The **linear-CDF decoder** interpolates generated quantiles and recovers cumulat
 \end{aligned}
 ```
 
-Endpoint quantiles use half-step extrapolation clipped to $`[0,1]`$, with $`\widehat F_0=0`$ and $`\widehat F_N=1`$. Repeating the flow from new sources yields multiple candidate spectra. See the [representation utilities](codes/utils/nmr_utils.py), [training objective](codes/trainers/quantile_wasserstein_trainer.py), and [sampler](codes/samplers/quantile_wasserstein_sampler.py).
+Endpoint quantiles use half-step extrapolation clipped to $`[0,1]`$, with $`\widehat F_0=0`$ and $`\widehat F_N=1`$. See the [representation utilities](codes/utils/nmr_utils.py), [training objective](codes/trainers/quantile_wasserstein_trainer.py), and [sampler](codes/samplers/quantile_wasserstein_sampler.py).
 
 ## Installation
 
